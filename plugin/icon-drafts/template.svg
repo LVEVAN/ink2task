@@ -1,0 +1,40 @@
+<svg viewBox="0 0 1404 1872" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1404" height="1872" fill="#ffffff"/>
+
+  <!-- SYNC button pill; left edge aligned with the left end of the ruled lines (x85) -->
+  <rect x="85" y="100" width="292" height="84" rx="42" fill="#ededed" stroke="#111111" stroke-width="5"/>
+
+  <!-- Ink-drop logo inside the pill (drop designed in a 512 box, scaled down) -->
+  <g transform="translate(110,100.6) scale(0.15)">
+    <path d="M256 44 C 150 182 90 252 90 342 a 166 166 0 1 0 332 0 C 422 252 362 182 256 44 Z" fill="#111111"/>
+    <path d="M176 350 L232 408 L360 278" fill="none" stroke="#ffffff" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- SYNC label, centered with the drop on the pill's midline -->
+  <text x="185" y="161" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" fill="#111111" letter-spacing="1">SYNC</text>
+
+  <!-- DUE column header, centered over the due column (divider 1164 .. right 1320) -->
+  <text x="1242" y="158" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="46" font-weight="600" fill="#333333" letter-spacing="3">DUE</text>
+
+  <!-- Ruled rows: header line + 14 row separators, from left margin to right margin -->
+  <g stroke="#c8c8c8" stroke-width="2">
+    <line x1="85" y1="205" x2="1320" y2="205"/>
+    <line x1="85" y1="317" x2="1320" y2="317"/>
+    <line x1="85" y1="429" x2="1320" y2="429"/>
+    <line x1="85" y1="541" x2="1320" y2="541"/>
+    <line x1="85" y1="653" x2="1320" y2="653"/>
+    <line x1="85" y1="765" x2="1320" y2="765"/>
+    <line x1="85" y1="877" x2="1320" y2="877"/>
+    <line x1="85" y1="989" x2="1320" y2="989"/>
+    <line x1="85" y1="1101" x2="1320" y2="1101"/>
+    <line x1="85" y1="1213" x2="1320" y2="1213"/>
+    <line x1="85" y1="1325" x2="1320" y2="1325"/>
+    <line x1="85" y1="1437" x2="1320" y2="1437"/>
+    <line x1="85" y1="1549" x2="1320" y2="1549"/>
+    <line x1="85" y1="1661" x2="1320" y2="1661"/>
+    <line x1="85" y1="1773" x2="1320" y2="1773"/>
+  </g>
+
+  <!-- Vertical divider between task and DUE columns -->
+  <line x1="1164" y1="205" x2="1164" y2="1773" stroke="#c8c8c8" stroke-width="2"/>
+</svg>

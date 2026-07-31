@@ -1,0 +1,12 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Ink drop (teardrop): narrow point at top, round bulb at bottom -->
+  <path d="M256 44
+           C 150 182 90 252 90 342
+           a 166 166 0 1 0 332 0
+           C 422 252 362 182 256 44 Z"
+        fill="#000000"/>
+  <!-- Checkmark knocked out of the drop (white = the negative space) -->
+  <path d="M176 350 L232 408 L360 278"
+        fill="none" stroke="#ffffff" stroke-width="48"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,29 @@
+# OS cruft
+.DS_Store
+
+# Personal data -- real handwriting/task backups, never meant to be public
+/backups/
+
+# Dependencies (each sub-project has its own package.json)
+node_modules/
+
+# Build outputs
+build/
+dist/
+.build/
+android/app/build/
+
+# Secrets -- each backend keeps its own .gitignore too, this is a backstop
+.env
+credentials.env
+*.p8
+*.pem
+*.keystore
+!debug.keystore
+
+# Python
+__pycache__/
+
+# Editor
+.vscode/
+.idea/

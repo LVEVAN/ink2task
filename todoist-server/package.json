@@ -1,0 +1,19 @@
+{
+  "name": "ink2task-todoist-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Todoist backend for the Ink2Task Supernote plugin -- a drop-in alternative to mac-server and google-tasks-server, runnable on any always-on host.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}

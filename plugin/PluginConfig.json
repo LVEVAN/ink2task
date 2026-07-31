@@ -1,0 +1,10 @@
+{
+  "name": "Ink2Task",
+  "desc": "Handwrite and check off tasks on your Supernote, synced with Apple Reminders, Google Tasks, or Todoist",
+  "iconPath": "assets/icon.png",
+  "versionName": "1.0.0",
+  "versionCode": "107",
+  "pluginID": "ink2task001",
+  "pluginKey": "Ink2Task",
+  "jsMainPath": "index"
+}
