@@ -65,9 +65,7 @@ share an identical API, so the plugin doesn't know or care which is running.
 | Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet |
 
 **Todoist is a special case: no server needed at all.** Paste a personal API
-token directly into the plugin's Sync Settings (Todoist -> Settings ->
-Integrations -> Developer) and it talks to Todoist's cloud straight from the
-tablet. [`todoist-server`](todoist-server/README.md) still exists as an
+token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at todoist.com/app/settings/integrations/developer (scroll to "API token"). You don't need an always-on Mac; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
 optional standalone service if you'd rather keep the token off the tablet
 entirely, but most people won't need it.
 
@@ -77,7 +75,7 @@ concept and due dates are date-only.
 
 ## Install
 
-**1. Set up a backend** (pick one from the table above) -- e.g. for Apple
+**1. Set up a backend (For Todoist, skip this step entirely... see above). ** (pick one from the table above) -- e.g. for Apple
 Reminders:
 
 ```bash
@@ -89,7 +87,7 @@ cd Ink2Task/mac-server
 `setup.sh` builds the server, installs it as a login-time service (auto-starts,
 restarts on crash), asks which Reminders list to sync, and prints your Mac's
 LAN address. macOS will ask to allow Reminders access the first time -- click
-**Allow**. For Todoist, skip this step entirely (see above).
+**Allow**. 
 
 **2. Install the plugin.** Grab `Ink2Task.snplg` from the
 [latest release](../../releases), or build it yourself (see below). Copy it to
@@ -135,7 +133,7 @@ Capture Target**.
 
 ### Multiple lists on one note
 
-Add a page to the Ink2Task note with the device's own note tools, sync it
+Add a new note page to the Ink2Task note with the device's own note tools, sync it
 (from the plugin's Settings, choosing whatever list/backend you want), and it
 becomes its own independent checklist -- its own SYNC button, its own bound
 list. Lasso captures and the on-page SYNC button both automatically use
