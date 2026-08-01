@@ -65,7 +65,7 @@ share an identical API, so the plugin doesn't know or care which is running.
 | Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet |
 
 **Todoist is a special case: no server needed at all.** Paste a personal API
-token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (scroll to "API token"). You don't need an always-on Mac; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
+token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
 optional standalone service if you'd rather keep the token off the tablet
 entirely, but most people won't need it.
 
