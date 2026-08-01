@@ -9,6 +9,15 @@ but scoped around one dedicated checklist note instead of a full in-plugin
 task-manager UI: your tasks live where you actually write, and Ink2Task keeps
 that page and your task list in sync.
 
+Download the plugin directly here: https://github.com/LVEVAN/ink2task/releases
+
+**EXAMPLE**
+
+
+https://github.com/user-attachments/assets/2c2821fc-eda9-4c73-ace8-8fbcb9faa303
+
+
+
 ## What you can do
 
 - **Check off tasks by hand** -- draw a check in a box, tap the on-page SYNC
