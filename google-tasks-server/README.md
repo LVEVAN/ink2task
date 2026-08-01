@@ -140,7 +140,7 @@ run it always-on with one of the options below.
 Pick whichever fits your host. Both restart the server on crash and on reboot,
 so you set it up once and forget it.
 
-### Option A — pm2 (simplest, works on macOS / Linux / a Pi)
+### Option A — pm2 (simplest, works on macOS / Linux / a Pi -- Windows users see Option C)
 
 ```bash
 npm install -g pm2
@@ -188,6 +188,27 @@ journalctl -u ink2task-google -f           # follow its logs
 Either way, do the `npm run authorize` step **once as the same user** before
 starting the service, so the refresh token exists in that user's
 `~/.ink2task-google/config.json`.
+
+### Option C — Windows
+
+`pm2` itself works fine on Windows, but its `pm2 startup` command (used above)
+only knows how to register with systemd/launchd, not Windows' Task Scheduler --
+use the `pm2-windows-startup` package instead to get the same "survives a
+reboot" behavior:
+
+```powershell
+npm install -g pm2 pm2-windows-startup
+pm2-startup install
+cd google-tasks-server
+pm2 start npm --name ink2task-google -- start
+pm2 save
+```
+
+Without that extra step, plain `pm2 start` still restarts the server if it
+crashes, but won't bring it back after a reboot -- you'd need to run
+`pm2 resurrect` (or the two commands above) yourself after restarting the PC.
+Same `npm run authorize` step first, same `pm2 logs` / `pm2 restart` commands
+to manage it afterward.
 
 ## Point the plugin at this server
 
