@@ -49,7 +49,7 @@ import {
   takeRedrawWarning,
   dropGhostStrokes,
   inkPrintsOf,
-  countInk,
+  verifyEraseAndRetry,
 } from '../utils/checklistPage';
 import {ensureNote} from '../utils/ensureNote';
 import {captureAndCreate} from '../utils/capture';
@@ -157,7 +157,10 @@ export default function Home() {
       // "Reading the page…" forever with no way out but reinstalling the plugin
       // (0.2.89). canSyncHere is meant to stop that tap before it happens, but
       // this is the real backstop -- a UI gate can race, this can't hang.
-      const {notePath, page, isTemplatePage} = await withTimeout(resolveTarget(config), 8000, 'resolveTarget');
+      // Resolved ONCE and threaded into every step below -- each resolve costs
+      // several native round-trips, and they all act on the same page anyway.
+      const target = await withTimeout(resolveTarget(config), 8000, 'resolveTarget');
+      const {notePath, page, isTemplatePage} = target;
       const noteJustCreated = await ensureNote(notePath);
       // Bind this page to the selected profile+list, so its on-page SYNC
       // re-syncs the same backend/list and other pages can hold different
@@ -180,6 +183,9 @@ export default function Home() {
       const scan = firstAfterInstall
         ? {...rawScan, centers: [], strokes: [], texts: []}
         : dropGhostStrokes(rawScan, (await loadErasedInk())[inkKey] || []);
+      // Whether there was any user ink to erase at all -- gates the two
+      // post-redraw verification reads below (the common repeat-sync has none).
+      const hadInk = (rawScan.strokes?.length ?? 0) > 0;
       setStatus({kind: 'busy', message: 'Reading your handwriting…'});
       // Capture any handwriting in the blank boxes first (creates reminders and
       // marks those rows captured-in-place), before the redraw below.
@@ -187,7 +193,7 @@ export default function Home() {
       let warnings: string[] = [];
       let duesSet: string[] = [];
       try {
-        const cap = await captureAndCreate(eff, scan);
+        const cap = await captureAndCreate(eff, scan, target);
         captured = cap.created;
         warnings = cap.warnings;
         duesSet = cap.duesSet;
@@ -199,7 +205,7 @@ export default function Home() {
       // Complete any checked-off tasks (their checkmarks get wiped below).
       let completedTitles: string[] = [];
       try {
-        completedTitles = (await syncCompleted(eff, {skipReload: true, scan})).completedTitles;
+        completedTitles = (await syncCompleted(eff, {skipReload: true, scan, target})).completedTitles;
       } catch (e: any) {
         console.log('Ink2Task: sync-completed failed', e?.message);
       }
@@ -245,14 +251,19 @@ export default function Home() {
       setStatus({kind: 'busy', message: 'Saving…'});
       await reloadIfOpen(notePath);
       // Verify the erase AFTER the save/reload -- saveCurrentNote writes the
-      // editor's in-memory buffer, which can put the ink straight back.
-      const leftover = await countInk(notePath, page);
-      if (leftover > 0) {
-        warnings = [
-          ...warnings,
-          `Handwriting not erased -- ${leftover} stroke(s) came back after saving. ` +
-            'The page save appears to be restoring them.',
-        ];
+      // editor's in-memory buffer, which can put the ink straight back. Only
+      // worth the round-trip when there was ink to erase in the first place.
+      if (hadInk) {
+        const {leftover, retried} = await verifyEraseAndRetry(notePath, page);
+        // A retry rewrote the page after the reload, so repaint to show it.
+        if (retried && leftover === 0) await reloadIfOpen(notePath);
+        if (leftover > 0) {
+          warnings = [
+            ...warnings,
+            `Handwriting not erased -- ${leftover} stroke(s) came back after saving. ` +
+              'The page save appears to be restoring them.',
+          ];
+        }
       }
       setLastCount(entries.length);
       setStatus({
@@ -302,10 +313,18 @@ export default function Home() {
       setListOptions(null); // lists belong to the previous server
       setListPickerOpen(false);
       const p = next.profiles[next.activeProfile];
-      setStatus({
-        kind: 'ok',
-        message: `Switched to "${p.label}"${p.host ? ` (${p.host})` : ' — set its IP below'}.`,
-      });
+      // Todoist talks straight to the cloud -- it has no host/IP to set, so
+      // point at the thing it DOES need (a token) rather than an IP field that
+      // isn't even shown for this backend.
+      const hint =
+        p.backend === 'todoist'
+          ? p.token
+            ? ''
+            : ' — set its API token below'
+          : p.host
+            ? ` (${p.host})`
+            : ' — set its IP below';
+      setStatus({kind: 'ok', message: `Switched to "${p.label}"${hint}.`});
     },
     [config],
   );

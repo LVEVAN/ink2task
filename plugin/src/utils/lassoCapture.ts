@@ -16,7 +16,7 @@ import {PluginCommAPI, PluginFileAPI, PluginNoteAPI, Element} from 'sn-plugin-li
 import {unwrap} from './sdk';
 import {emrToScreen} from './checklistPage';
 import {loadConfig, effectiveConfigForPage, saveTaskSource} from './config';
-import {resolveLassoTarget} from './target';
+import {resolveLassoTarget, isNoteOpen} from './target';
 import {toAbsolute} from './notePicker';
 import {parseDueDate} from './dateParse';
 import {createReminder} from '../api/macServer';
@@ -151,18 +151,29 @@ export async function removeBackLink(
       .filter((n: any) => typeof n === 'number');
     if (nums.length === 0) return;
 
-    // Same open-note ordering as the insert: flush the editor's buffer first so
-    // nothing unsaved is lost, delete from the file, then repaint from the file.
-    try {
-      await unwrap(PluginNoteAPI.saveCurrentNote(), 'saveCurrentNote');
-    } catch {
-      // best-effort flush
+    // Same open-note ordering as the insert -- flush the editor's buffer first
+    // so nothing unsaved is lost, delete from the file, then repaint from it --
+    // but ONLY when the source note is the one on screen. saveCurrentNote and
+    // reloadFile always act on the OPEN note, and this runs during a checklist
+    // sync, where the open note is the CHECKLIST, not this source note. Doing
+    // them unconditionally repainted the checklist once per dead link, which is
+    // the bulk of the "too many redraws at the end of a sync" -- and achieved
+    // nothing, since the note actually being edited here isn't on screen.
+    const openHere = await isNoteOpen(srcPath);
+    if (openHere) {
+      try {
+        await unwrap(PluginNoteAPI.saveCurrentNote(), 'saveCurrentNote');
+      } catch {
+        // best-effort flush
+      }
     }
     await unwrap(PluginFileAPI.deleteElements(srcPath, srcPage, nums), 'deleteElements');
-    try {
-      await unwrap(PluginCommAPI.reloadFile(), 'reloadFile');
-    } catch {
-      // cosmetic
+    if (openHere) {
+      try {
+        await unwrap(PluginCommAPI.reloadFile(), 'reloadFile');
+      } catch {
+        // cosmetic
+      }
     }
   } catch (e: any) {
     console.log('[Ink2Task] back-link removal failed:', e?.message);

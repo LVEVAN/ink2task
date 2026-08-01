@@ -21,6 +21,7 @@ import {
 import type {MainLayerScan} from './checklistPage';
 import {loadRegistry, saveRegistryEntries, registryKey} from './config';
 import {resolveTarget} from './target';
+import type {Target} from './target';
 import {createReminder, updateReminderDue} from '../api/macServer';
 import {parseDueDate} from './dateParse';
 import type {ChecklistEntry, Ink2TaskConfig} from './config';
@@ -56,8 +57,12 @@ export type CapturedBox = {
 export async function captureAndCreate(
   config: Ink2TaskConfig,
   scan?: MainLayerScan,
+  target?: Target,
 ): Promise<CaptureResult> {
-  const {notePath, page} = await resolveTarget(config);
+  // The Sync flows resolve the target once and pass it down; resolving it again
+  // per step costs several native round-trips (and those calls can hang -- see
+  // withTimeout in sdk.ts). Standalone callers still resolve their own.
+  const {notePath, page} = target ?? (await resolveTarget(config));
   const key = registryKey(notePath, page);
   const registry = await loadRegistry();
   const entries = registry[key] || [];

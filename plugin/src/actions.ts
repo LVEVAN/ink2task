@@ -36,11 +36,12 @@ import {
   takeRedrawWarning,
   dropGhostStrokes,
   inkPrintsOf,
-  countInk,
+  verifyEraseAndRetry,
 } from './utils/checklistPage';
 import type {MainLayerScan} from './utils/checklistPage';
 import {ensureNote} from './utils/ensureNote';
 import {resolveTarget, reloadIfOpen} from './utils/target';
+import type {Target} from './utils/target';
 import {toAbsolute} from './utils/notePicker';
 import {captureAndCreate} from './utils/capture';
 import {removeBackLink} from './utils/lassoCapture';
@@ -48,9 +49,9 @@ import {removeBackLink} from './utils/lassoCapture';
 /** Pull the latest reminders and (re)draw the checklist onto its note page. */
 export async function fetchAndWrite(
   config: Ink2TaskConfig,
-  opts: {skipReload?: boolean} = {},
+  opts: {skipReload?: boolean; target?: Target} = {},
 ): Promise<number> {
-  const {notePath, page, isTemplatePage} = await resolveTarget(config);
+  const {notePath, page, isTemplatePage} = opts.target ?? (await resolveTarget(config));
   await ensureNote(notePath);
   const key = registryKey(notePath, page);
   const previous = (await loadRegistry())[key] || [];
@@ -162,9 +163,9 @@ export function formatSyncSummary(
  */
 export async function syncCompleted(
   config: Ink2TaskConfig,
-  opts: {skipReload?: boolean; scan?: MainLayerScan} = {},
+  opts: {skipReload?: boolean; scan?: MainLayerScan; target?: Target} = {},
 ): Promise<SyncResult> {
-  const {notePath, page} = await resolveTarget(config);
+  const {notePath, page} = opts.target ?? (await resolveTarget(config));
   const key = registryKey(notePath, page);
   const entries = (await loadRegistry())[key] || [];
   if (entries.length === 0) return {completed: 0, completedTitles: [], unchecked: 0, failed: 0};
@@ -233,8 +234,11 @@ export async function syncThenFetch(
 ): Promise<SyncThenFetch> {
   // The on-page SYNC button is physically ON a note/page, so it always syncs
   // THAT page -- resolveTarget already does this (it uses the current page
-  // when you're on the Ink2Task note, else falls back to page 0).
-  const {notePath, page} = await resolveTarget(config);
+  // when you're on the Ink2Task note, else falls back to page 0). Resolved
+  // ONCE here and threaded into every step below: each resolve is several
+  // native round-trips, and the steps all act on the same page anyway.
+  const target = await resolveTarget(config);
+  const {notePath, page} = target;
 
   // ⚠️ SAFETY GATE (fixes catastrophic data loss): the on-page listener fires on
   // screen COORDINATES alone, on ANY open note -- so a stray pen stroke in the
@@ -280,7 +284,7 @@ export async function syncThenFetch(
   // settle before the fetch so the redraw reflects the just-created and
   // just-completed tasks.
   const [cap, s] = await Promise.all([
-    captureAndCreate(eff, scan).catch((e: any) => {
+    captureAndCreate(eff, scan, target).catch((e: any) => {
       console.log('[Ink2Task] capture failed:', e?.message);
       return {
         created: [] as string[],
@@ -288,12 +292,17 @@ export async function syncThenFetch(
         warnings: [`Capture failed: ${e?.message || 'unknown error'}`],
       };
     }),
-    syncCompleted(eff, {skipReload: true, scan}),
+    syncCompleted(eff, {skipReload: true, scan, target}),
   ]);
+
+  // Nothing of the user's was on the page, so there's nothing the redraw could
+  // fail to erase -- skip both erase checks (a getElements round-trip inside
+  // the erase check below) on what is the common repeat-sync case.
+  const hadInk = (rawScan.strokes?.length ?? 0) > 0;
 
   // fetchAndWrite does the ONE page mutation: writeChecklist -> replaceElements
   // wipes all user ink and draws the fresh, repacked list in a single op.
-  const added = await fetchAndWrite(eff, {skipReload: true});
+  const added = await fetchAndWrite(eff, {skipReload: true, target});
   // Remember the ink this sync just erased, so if the host restores it on a
   // reinstall the next sync can tell those strokes from genuinely new ones.
   // Fingerprints the RAW scan: ghosts stay ghosts until real ink replaces them.
@@ -307,16 +316,19 @@ export async function syncThenFetch(
   const warnings = redrawWarning ? [...cap.warnings, redrawWarning] : cap.warnings;
   await reloadIfOpen(notePath);
 
-  // Verify the erase AFTER the save/reload, not just after the redraw. The
-  // check inside writeChecklist reads the state replaceElements just produced,
-  // so it always saw a clean page -- but saveCurrentNote then writes the
-  // editor's in-memory buffer, which can still hold the ink and put it right
-  // back. This is the state the user actually sees.
-  const leftover = await countInk(notePath, page);
-  if (leftover > 0) {
-    warnings.push(
-      `Handwriting not erased -- ${leftover} stroke(s) still on the page after saving.`,
-    );
+  // Verify the erase AFTER the save/reload -- this is the state the user
+  // actually sees, and the only place a retry is worth an extra repaint. Only
+  // runs when there was ink to erase in the first place.
+  if (hadInk) {
+    const {leftover, retried} = await verifyEraseAndRetry(notePath, page);
+    // A retry rewrote the page after the reload, so repaint to show it. Rare:
+    // only when ink genuinely survived the first pass.
+    if (retried && leftover === 0) await reloadIfOpen(notePath);
+    if (leftover > 0) {
+      warnings.push(
+        `Handwriting not erased -- ${leftover} stroke(s) still on the page after saving.`,
+      );
+    }
   }
   return {...s, added, captured: cap.created, warnings, duesSet: cap.duesSet};
 }

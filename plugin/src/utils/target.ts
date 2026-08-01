@@ -90,6 +90,23 @@ export async function resolveLassoTarget(config: Ink2TaskConfig): Promise<{noteP
 }
 
 /**
+ * Whether the given note is the one currently open in the editor.
+ *
+ * Worth a round-trip whenever the alternative is a save+reload pair: those
+ * repaint the OPEN note regardless of which note the caller is editing, so
+ * running them for a note that isn't on screen costs two e-ink paints and
+ * achieves nothing (see removeBackLink).
+ */
+export async function isNoteOpen(notePath: string): Promise<boolean> {
+  try {
+    const current = (await unwrap<string>(PluginCommAPI.getCurrentFilePath(), 'getCurrentFilePath')) || '';
+    return toAbsolute(current) === toAbsolute(notePath);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Persists the current note, then asks the host to re-read it.
  *
  * The save is essential, not cosmetic: after a sync wipes the ink layer and

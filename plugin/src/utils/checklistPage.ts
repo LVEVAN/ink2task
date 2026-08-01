@@ -759,29 +759,9 @@ export async function writeChecklist(
       await unwrap(PluginFileAPI.insertElements(notePath, page, elements), 'insertElements');
     }
 
-    // On some notes (e.g. one with real-time recognition on) replaceElements
-    // can succeed but leave a handful of handwriting strokes behind -- likely
-    // the note's recognition engine re-materializing a stroke right around
-    // when replaceElements runs, not a failed wipe. Since replaceElements is
-    // proven able to erase ink, retry it ONCE more if anything survived. Only
-    // pays this extra round-trip when needed -- a clean note never takes the hit.
-    try {
-      const after = await unwrap<any[]>(PluginFileAPI.getElements(page, notePath), 'getElements');
-      let ink = (after || []).filter((el: any) => el.type === 0).length;
-      if (ink > 0) {
-        await unwrap(PluginFileAPI.replaceElements(notePath, page, elements), 'replaceElements');
-        const after2 = await unwrap<any[]>(PluginFileAPI.getElements(page, notePath), 'getElements');
-        ink = (after2 || []).filter((el: any) => el.type === 0).length;
-      }
-      // Still ink after the retry: the erase genuinely didn't take. Report it
-      // rather than leaving the user to discover it when they delete the plugin
-      // and the "erased" handwriting is revealed underneath the checklist.
-      if (ink > 0 && !_redrawWarning) {
-        _redrawWarning = `Handwriting not erased -- ${ink} stroke(s) still on the page after redraw.`;
-      }
-    } catch {
-      // best-effort erase-verification; not worth failing the sync over
-    }
+    // Remember what we drew so verifyEraseAndRetry() can re-apply it later
+    // WITHOUT rebuilding every element (~66 native round-trips).
+    _lastDrawn = {notePath, page, elements};
   }
 
   return entries;
@@ -805,6 +785,12 @@ export function takeRedrawWarning(): string {
 }
 
 /**
+ * The elements the last writeChecklist drew, so the erase check below can
+ * re-apply them without rebuilding all ~66 of them from scratch.
+ */
+let _lastDrawn: {notePath: string; page: number; elements: any[]} | null = null;
+
+/**
  * How many handwriting strokes are on the page right now.
  *
  * Meant to be called AFTER the save/reload round-trip, not just after
@@ -820,6 +806,42 @@ export async function countInk(notePath: string, page: number): Promise<number> 
   } catch {
     return 0; // can't tell -- don't cry wolf
   }
+}
+
+/**
+ * Confirms the redraw actually erased the user's handwriting, and re-applies
+ * the checklist once if it didn't.
+ *
+ * Call this AFTER the save/reload, never before. An identical check used to sit
+ * inside writeChecklist, immediately after replaceElements -- but at that point
+ * the editor still holds the just-written strokes in its unsaved buffer, so the
+ * check saw ink that the save/reload was about to discard anyway and fired a
+ * second full-page replaceElements essentially every time handwriting was
+ * captured. That retry was a third e-ink repaint on every capture sync, doing
+ * no real work. Checking here instead means the retry only costs a paint when
+ * ink genuinely survived, which is rare.
+ *
+ * Returns the leftover stroke count (0 = clean) and whether a retry was made,
+ * so the caller can repaint only in that rare case.
+ */
+export async function verifyEraseAndRetry(
+  notePath: string,
+  page: number,
+): Promise<{leftover: number; retried: boolean}> {
+  const ink = await countInk(notePath, page);
+  if (ink === 0) return {leftover: 0, retried: false};
+  const drawn = _lastDrawn;
+  if (!drawn || drawn.notePath !== notePath || drawn.page !== page) {
+    return {leftover: ink, retried: false};
+  }
+  // replaceElements is proven able to erase ink (it's what wipes the page in
+  // the first place), so one more attempt is worth it before reporting failure.
+  try {
+    await unwrap(PluginFileAPI.replaceElements(notePath, page, drawn.elements), 'replaceElements');
+  } catch {
+    return {leftover: ink, retried: false};
+  }
+  return {leftover: await countInk(notePath, page), retried: true};
 }
 
 
