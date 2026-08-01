@@ -84,8 +84,10 @@ concept and due dates are date-only.
 
 ## Install
 
-**1. Set up a backend (For Todoist, skip this step entirely... see above). ** (pick one from the table above) -- e.g. for Apple
-Reminders:
+**1. Set up a backend** (pick one from the table above -- for Todoist, skip
+this step entirely, see above). Example for Apple Reminders: open the
+**Terminal** app on your Mac (Spotlight search, or Applications > Utilities >
+Terminal), then run:
 
 ```bash
 git clone <this-repo>
