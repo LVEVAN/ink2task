@@ -16,7 +16,22 @@ import {unwrap} from './sdk';
 import {toAbsolute} from './notePicker';
 import type {Ink2TaskConfig} from './config';
 
-export type Target = {notePath: string; page: number; isTemplatePage: boolean};
+export type Target = {
+  notePath: string;
+  page: number;
+  isTemplatePage: boolean;
+  /**
+   * Whether the checklist note is the one currently ON SCREEN.
+   *
+   * `notePath` is ALWAYS the configured checklist note -- resolveTarget never
+   * returns the open note's path -- so it can't be compared against
+   * config.notePath to tell "am I on the checklist?" (that check is always
+   * true, which is how the on-page SYNC button ended up firing from other
+   * notes). This is the real answer, and it's free: resolveTarget already
+   * compares the two to decide which page to target.
+   */
+  isOpen: boolean;
+};
 
 /**
  * Page 0 is the first page: PluginFileAPI's page-taking calls are documented
@@ -36,7 +51,7 @@ export async function resolveTarget(config: Ink2TaskConfig): Promise<Target> {
     // not on any note (e.g. opened from Settings) -- fall through to page 0
   }
   if (toAbsolute(rawPath) !== notePath) {
-    return {notePath, page: FIRST_PAGE, isTemplatePage: true};
+    return {notePath, page: FIRST_PAGE, isTemplatePage: true, isOpen: false};
   }
   const page = await unwrap<number>(PluginCommAPI.getCurrentPageNum(), 'getCurrentPageNum');
   const resolvedPage = typeof page === 'number' ? page : FIRST_PAGE;
@@ -59,7 +74,7 @@ export async function resolveTarget(config: Ink2TaskConfig): Promise<Target> {
       // best effort; keep the index-based guess
     }
   }
-  return {notePath, page: resolvedPage, isTemplatePage};
+  return {notePath, page: resolvedPage, isTemplatePage, isOpen: true};
 }
 
 /**

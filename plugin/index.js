@@ -16,6 +16,7 @@ import App from './App';
 import {name as appName} from './app.json';
 import {PluginManager, NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
 import {loadConfig} from './src/utils/config';
+import {toAbsolute} from './src/utils/notePicker';
 import {syncThenFetch, formatSyncSummary} from './src/actions';
 import {addLassoedTaskToInk2Task} from './src/utils/lassoCapture';
 import {unwrap} from './src/utils/sdk';
@@ -136,12 +137,18 @@ PluginManager.registerMotionListener(1, {
         if (!/\.note$/i.test(openPath)) return; // not on a note -- ignore
 
         const config = await loadConfig();
+        // ...and only when that note is OUR checklist. Every note passes the
+        // .note test above, so without this a corner tap on any note at all
+        // started a sync. syncThenFetch re-checks this itself (requireOpenNote
+        // below); this just avoids the wasted work of getting that far.
+        if (toAbsolute(openPath) !== toAbsolute(config.notePath)) return;
         // No "Syncing…" popup: the plugin view can only open FULLSCREEN (the JS
         // SDK never exposes the regionType/showData field the native docs
         // describe, and showPluginView takes no arguments), which was more
         // disruptive than the wait it was covering.
-        // Pass the button zone so a pen-tap ink dot gets wiped afterward.
-        const r = await syncThenFetch(config, ZONE);
+        // requireOpenNote: this listener is global and fires on coordinates
+        // alone, so the sync itself must confirm we're on the checklist note.
+        const r = await syncThenFetch(config, {requireOpenNote: true});
         // The tap landed on a note the plugin doesn't manage (a stray corner
         // stroke on some OTHER note): syncThenFetch did nothing. Stay silent --
         // no dialog, and above all nothing was drawn over the user's page.

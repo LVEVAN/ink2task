@@ -42,7 +42,6 @@ import type {MainLayerScan} from './utils/checklistPage';
 import {ensureNote} from './utils/ensureNote';
 import {resolveTarget, reloadIfOpen} from './utils/target';
 import type {Target} from './utils/target';
-import {toAbsolute} from './utils/notePicker';
 import {captureAndCreate} from './utils/capture';
 import {removeBackLink} from './utils/lassoCapture';
 
@@ -218,19 +217,21 @@ const SKIPPED_RESULT: SyncThenFetch = {
   skipped: true,
 };
 
-export type Zone = {left: number; top: number; right: number; bottom: number};
-
 /**
  * The on-page button action: process the checks you've drawn (Sync), then pull
  * the latest list and redraw (Fetch). Sync runs first so a Fetch redraw can't
  * wipe your checkmarks before they're read.
  *
- * `cleanZone` (page fractions), when given, erases the ink dot a pen tap leaves
- * on the button -- done last, after Fetch has already read any real checkmarks.
+ * `requireOpenNote` makes this a no-op unless the checklist note is the one on
+ * screen. The on-page SYNC button MUST pass it -- its motion listener is global
+ * and fires on screen coordinates alone, so without it a corner tap on any
+ * other note starts a sync. Lasso capture deliberately leaves it off: it runs
+ * from whatever note you lassoed on and needs the checklist redrawn in the
+ * background.
  */
 export async function syncThenFetch(
   config: Ink2TaskConfig,
-  _cleanZone?: Zone,
+  opts: {requireOpenNote?: boolean} = {},
 ): Promise<SyncThenFetch> {
   // The on-page SYNC button is physically ON a note/page, so it always syncs
   // THAT page -- resolveTarget already does this (it uses the current page
@@ -240,13 +241,21 @@ export async function syncThenFetch(
   const target = await resolveTarget(config);
   const {notePath, page} = target;
 
-  // ⚠️ SAFETY GATE (fixes catastrophic data loss): the on-page listener fires on
-  // screen COORDINATES alone, on ANY open note -- so a stray pen stroke in the
-  // top-left corner of an UNRELATED note used to run a full sync and wipe that
-  // page (replaceElements) into the template. Never touch a page the plugin
-  // doesn't manage -- only the one Ink2Task note. Anything else: do nothing,
-  // silently.
-  if (notePath !== toAbsolute(config.notePath)) return SKIPPED_RESULT;
+  // ⚠️ SAFETY GATE: the on-page listener fires on screen COORDINATES alone, on
+  // ANY open note -- a tap in the top-left corner of an UNRELATED note used to
+  // kick off a full sync (0.2.52 wiped that note; today it targets the
+  // checklist note instead, so it's a surprise sync + dialog rather than data
+  // loss -- but it still must not happen).
+  //
+  // This gate USED to read `notePath !== toAbsolute(config.notePath)`, which
+  // could never be true: resolveTarget always returns the configured checklist
+  // path, never the open note's. It went dead when "use current note" mode was
+  // removed and stayed dead. target.isOpen is the real check.
+  //
+  // Only the on-page button passes requireOpenNote -- lasso capture calls this
+  // from whatever note you lassoed on, and legitimately needs the background
+  // redraw.
+  if (opts.requireOpenNote && !target.isOpen) return SKIPPED_RESULT;
 
   const eff = effectiveConfigForPage(config, notePath, page);
   // Remember which profile+list this page actually just synced with, so it
