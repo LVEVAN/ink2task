@@ -13,7 +13,7 @@
  * doesn't manage -- see the on-page SYNC button's safety gate in actions.ts.
  */
 import {PluginCommAPI, PluginFileAPI, PluginNoteAPI, Element} from 'sn-plugin-lib';
-import {unwrap} from './sdk';
+import {unwrap, recycleElements} from './sdk';
 import {emrToScreen} from './checklistPage';
 import {loadConfig, effectiveConfigForPage, saveTaskSource} from './config';
 import {resolveLassoTarget, isNoteOpen} from './target';
@@ -77,6 +77,10 @@ export async function addLassoedTaskToInk2Task(): Promise<string | null> {
       )) || ''
     ).trim();
   }
+  // The selection has been read into `text` -- OCR is the last thing that needs
+  // the native stroke data, so release the whole selection here rather than
+  // leaking it on every capture.
+  recycleElements(elements);
   if (!text) return null;
 
   // A date written as part of the task ("Call dentist 8/9") should become the
@@ -149,6 +153,10 @@ export async function removeBackLink(
       )
       .map((el: any) => el.numInPage)
       .filter((n: any) => typeof n === 'number');
+    // Only the numInPage values are needed past this point -- the handles for
+    // this whole page (including the source note's own handwriting) can go
+    // back now. This runs once per completed lasso-captured task.
+    recycleElements(all);
     if (nums.length === 0) return;
 
     // Same open-note ordering as the insert -- flush the editor's buffer first

@@ -1,3 +1,5 @@
+import {PluginCommAPI} from 'sn-plugin-lib';
+
 /**
  * Shared unwrapping for the Supernote SDK's response envelopes.
  *
@@ -31,6 +33,36 @@ export async function unwrap<T>(call: Promise<any>, what: string): Promise<T> {
  * hangs forever with no way to recover except force-closing the plugin. Wrap any
  * call that might run outside a guaranteed note context in this.
  */
+/**
+ * Frees the native-side cache behind a batch of elements.
+ *
+ * Elements are native-backed: both getElements and createElement hand back a
+ * handle whose real data lives on the native side, and the SDK expects it to be
+ * released when you're done. Skipping this leaks on EVERY sync -- a redraw
+ * allocates ~66 elements and each page scan reads every element on the page --
+ * and the plugin lives in a long-running PluginHost process, so it accumulates
+ * across a session.
+ *
+ * NOTE: use `recycleElement(uuid)`, NOT `element.recycle()`. The SDK's Element
+ * CLASS has a recycle() method, but nothing we hold is an instance of it --
+ * `transformElements`/`createElement` mutate the raw bridge objects in place
+ * (attaching data accessors) rather than constructing Elements, so `.recycle`
+ * is undefined on them. Verified against sn-plugin-lib 0.1.43.
+ *
+ * Best-effort and never throws: a failed recycle must not fail a sync, and
+ * double-recycling a handle is not worth guarding against at every call site.
+ */
+export function recycleElements(elements: any[] | null | undefined): void {
+  for (const el of elements || []) {
+    try {
+      const uuid = el?.uuid;
+      if (typeof uuid === 'string' && uuid) PluginCommAPI.recycleElement(uuid);
+    } catch {
+      // already recycled, or a handle the host has since dropped
+    }
+  }
+}
+
 export async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   return Promise.race([
     promise,

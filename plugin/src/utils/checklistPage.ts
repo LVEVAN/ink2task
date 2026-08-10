@@ -17,7 +17,7 @@
 import {PluginFileAPI, PluginCommAPI, Element, Geometry, PointUtils} from 'sn-plugin-lib';
 import type {RemoteReminder} from '../api/macServer';
 import type {ChecklistEntry, TaskSource, TaskSources} from './config';
-import {unwrap} from './sdk';
+import {unwrap, recycleElements} from './sdk';
 
 /**
  * Elements are native-backed objects, not plain data: createElement allocates
@@ -760,8 +760,14 @@ export async function writeChecklist(
     }
 
     // Remember what we drew so verifyEraseAndRetry() can re-apply it later
-    // WITHOUT rebuilding every element (~66 native round-trips).
+    // WITHOUT rebuilding every element (~66 native round-trips). The PREVIOUS
+    // generation is dead once this one replaces it -- release it here, or every
+    // sync strands another ~66 native handles for the life of the process.
+    // (Can't recycle THIS generation yet: verifyEraseAndRetry may still re-send
+    // it after the save/reload.)
+    const stale = _lastDrawn?.elements;
     _lastDrawn = {notePath, page, elements};
+    if (stale && stale !== elements) recycleElements(stale);
   }
 
   return entries;
@@ -802,7 +808,10 @@ let _lastDrawn: {notePath: string; page: number; elements: any[]} | null = null;
 export async function countInk(notePath: string, page: number): Promise<number> {
   try {
     const els = await unwrap<any[]>(PluginFileAPI.getElements(page, notePath), 'getElements');
-    return (els || []).filter((el: any) => el.type === 0).length;
+    const n = (els || []).filter((el: any) => el.type === 0).length;
+    // Nothing here outlives the count, so every handle can go back immediately.
+    recycleElements(els);
+    return n;
   } catch {
     return 0; // can't tell -- don't cry wolf
   }
@@ -1198,8 +1207,16 @@ export async function scanMainLayer(notePath: string, page: number): Promise<Mai
   const centers: StrokeCenter[] = [];
   const strokes: any[] = [];
   const texts: TextElement[] = [];
+  // Everything this scan does NOT keep is dead weight the moment we skip it --
+  // on a drawn checklist page that's most of the page (our own checkboxes,
+  // labels, links, flags). Hand those handles straight back; the ones we retain
+  // are released by recycleScan() once the sync is done with them.
+  const dropped: any[] = [];
   for (const el of elements || []) {
-    if (el.layerNum !== MAIN_LAYER) continue;
+    if (el.layerNum !== MAIN_LAYER) {
+      dropped.push(el);
+      continue;
+    }
     if (el.type === 0) {
       // TYPE_STROKE
       strokes.push(el);
@@ -1212,10 +1229,30 @@ export async function scanMainLayer(notePath: string, page: number): Promise<Mai
       const text = (el.textBox?.textContentFull ?? '').trim();
       if (r && text) {
         texts.push({el, text, cx: (r.left + r.right) / 2, cy: (r.top + r.bottom) / 2});
+      } else {
+        dropped.push(el);
       }
+    } else {
+      dropped.push(el);
     }
   }
+  recycleElements(dropped);
   return {pageSize, centers, strokes, texts};
+}
+
+/**
+ * Releases the element handles a scan held on to (strokes + text boxes).
+ *
+ * Call ONCE at the very end of a sync, after capture/OCR and completion
+ * detection have finished with them -- those read stroke points off these
+ * handles, so recycling earlier would pull the data out from under them.
+ * A ghost-filtered scan (dropGhostStrokes) shares the same element objects as
+ * the raw scan, so recycling the raw one covers both.
+ */
+export function recycleScan(scan: MainLayerScan | null | undefined): void {
+  if (!scan) return;
+  recycleElements(scan.strokes);
+  recycleElements(scan.texts.map(t => t.el));
 }
 
 /**

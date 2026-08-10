@@ -37,6 +37,7 @@ import {
   dropGhostStrokes,
   inkPrintsOf,
   verifyEraseAndRetry,
+  recycleScan,
 } from './utils/checklistPage';
 import type {MainLayerScan} from './utils/checklistPage';
 import {ensureNote} from './utils/ensureNote';
@@ -231,8 +232,20 @@ const SKIPPED_RESULT: SyncThenFetch = {
  */
 export async function syncThenFetch(
   config: Ink2TaskConfig,
-  opts: {requireOpenNote?: boolean} = {},
+  opts: {requireOpenNote?: boolean; onPhase?: (message: string) => void} = {},
 ): Promise<SyncThenFetch> {
+  // Progress reporting is a CALLBACK, not a UI call, so this module stays free
+  // of presentation concerns: index.js drives the floating bubble with it, the
+  // Home screen drives its own status text, and neither knows about the other.
+  // Phases are deliberately coarse -- each one repaints the bubble, and e-ink
+  // repaints are slow and visible.
+  const phase = (m: string) => {
+    try {
+      opts.onPhase?.(m);
+    } catch {
+      // a progress indicator must never be able to fail a sync
+    }
+  };
   // The on-page SYNC button is physically ON a note/page, so it always syncs
   // THAT page -- resolveTarget already does this (it uses the current page
   // when you're on the Ink2Task note, else falls back to page 0). Resolved
@@ -276,6 +289,7 @@ export async function syncThenFetch(
   // Read the page ONCE and share it: capture (blank + due boxes) and completion
   // detection all work off this single scan instead of each re-reading the page
   // and re-bounding every stroke -- the biggest sync-speed lever.
+  phase('Reading the page…');
   const rawScan = await scanMainLayer(notePath, page);
   const inkKey = registryKey(notePath, page);
   // FIRST SYNC AFTER AN INSTALL: installing makes the host revert our page
@@ -292,6 +306,7 @@ export async function syncThenFetch(
   // running them together shaves a network round-trip off every sync. Both must
   // settle before the fetch so the redraw reflects the just-created and
   // just-completed tasks.
+  phase('Reading your handwriting…');
   const [cap, s] = await Promise.all([
     captureAndCreate(eff, scan, target).catch((e: any) => {
       console.log('[Ink2Task] capture failed:', e?.message);
@@ -311,6 +326,7 @@ export async function syncThenFetch(
 
   // fetchAndWrite does the ONE page mutation: writeChecklist -> replaceElements
   // wipes all user ink and draws the fresh, repacked list in a single op.
+  phase('Fetching and redrawing…');
   const added = await fetchAndWrite(eff, {skipReload: true, target});
   // Remember the ink this sync just erased, so if the host restores it on a
   // reinstall the next sync can tell those strokes from genuinely new ones.
@@ -323,6 +339,7 @@ export async function syncThenFetch(
   // looks fine (the checklist covers the ink) until the plugin is removed.
   const redrawWarning = takeRedrawWarning();
   const warnings = redrawWarning ? [...cap.warnings, redrawWarning] : cap.warnings;
+  phase('Saving…');
   await reloadIfOpen(notePath);
 
   // Verify the erase AFTER the save/reload -- this is the state the user
@@ -339,5 +356,9 @@ export async function syncThenFetch(
       );
     }
   }
+  // Everything that needed the scanned page handles (capture/OCR, completion
+  // detection, the erase checks) is done -- hand them back. Recycling the raw
+  // scan covers the ghost-filtered one too; they share the same objects.
+  recycleScan(rawScan);
   return {...s, added, captured: cap.created, warnings, duesSet: cap.duesSet};
 }

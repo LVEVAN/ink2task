@@ -50,6 +50,7 @@ import {
   dropGhostStrokes,
   inkPrintsOf,
   verifyEraseAndRetry,
+  recycleScan,
 } from '../utils/checklistPage';
 import {ensureNote} from '../utils/ensureNote';
 import {captureAndCreate} from '../utils/capture';
@@ -265,6 +266,10 @@ export default function Home() {
           ];
         }
       }
+      // Everything that needed the scanned page handles (capture/OCR,
+      // completion detection, the erase checks) is done -- hand them back.
+      // Recycling the raw scan covers the ghost-filtered one too; same objects.
+      recycleScan(rawScan);
       setLastCount(entries.length);
       setStatus({
         kind: warnings.length > 0 ? 'error' : 'ok',

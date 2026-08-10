@@ -17,6 +17,7 @@ import {name as appName} from './app.json';
 import {PluginManager, NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
 import {loadConfig} from './src/utils/config';
 import {toAbsolute} from './src/utils/notePicker';
+import {overlayShow, overlayUpdate, overlayHide} from './src/utils/overlay';
 import {syncThenFetch, formatSyncSummary} from './src/actions';
 import {addLassoedTaskToInk2Task} from './src/utils/lassoCapture';
 import {unwrap} from './src/utils/sdk';
@@ -148,7 +149,19 @@ PluginManager.registerMotionListener(1, {
         // disruptive than the wait it was covering.
         // requireOpenNote: this listener is global and fires on coordinates
         // alone, so the sync itself must confirm we're on the checklist note.
-        const r = await syncThenFetch(config, {requireOpenNote: true});
+        //
+        // onPhase drives the floating progress bubble. This is the ONLY sync
+        // path that needs it -- the Settings screen has its own status text --
+        // and it's why the native overlay exists at all: an on-page sync runs
+        // ~18s with nothing on screen, so the device looks frozen. Every
+        // overlay call is best-effort and returns false rather than throwing
+        // when the module or permission is missing, so a sync behaves
+        // identically with or without a bubble.
+        overlayShow('Ink2Task: syncing…');
+        const r = await syncThenFetch(config, {
+          requireOpenNote: true,
+          onPhase: msg => overlayUpdate('Ink2Task: ' + msg),
+        });
         // The tap landed on a note the plugin doesn't manage (a stray corner
         // stroke on some OTHER note): syncThenFetch did nothing. Stay silent --
         // no dialog, and above all nothing was drawn over the user's page.
@@ -178,6 +191,9 @@ PluginManager.registerMotionListener(1, {
           NativeUIUtils.showRattaDialog('Ink2Task: ' + capFirst(msg), 'OK', '', false);
         } catch (_) {}
       } finally {
+        // MUST be in finally: if the sync throws partway, an orphaned bubble
+        // stays painted over the note with nothing left to remove it.
+        overlayHide();
         busy = false;
         // Re-arm the debounce from when work *finished*, so a slow (e.g. offline,
         // timing-out) sync can't be immediately re-triggered by another tap.

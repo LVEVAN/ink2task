@@ -1,6 +1,27 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      WARNING: do NOT re-add SYSTEM_ALERT_WINDOW here.
+
+      It was added in v1.0.5 for the sync-progress overlay and is the prime
+      suspect for the regression that build caused: the on-page SYNC button
+      stopped receiving taps entirely (and so the post-sync dialog never
+      appeared), while the in-plugin Settings sync kept working. That points at
+      the GLOBAL hook (registerMotionListener) being withheld, which a host
+      that sandboxes plugins could plausibly do to a plugin asking for a
+      sensitive permission the host itself may not hold.
+
+      It also buys us nothing. This APK is never installed as an app; the code
+      runs inside com.ratta.supernote.pluginhost's process, so
+      Settings.canDrawOverlays() reads the HOST's permission and our manifest
+      governs nothing. If the overlay is ever built, the permission has to come
+      from the host, not from here.
+
+      (Keep prose here free of a doubled hyphen: XML forbids it inside a
+      comment, and the manifest merger fails with a bare "Error parsing
+      AndroidManifest.xml" that names no line.)
+    -->
 
     <application
       android:name=".MainApplication"

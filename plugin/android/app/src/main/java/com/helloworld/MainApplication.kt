@@ -20,6 +20,15 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
+              //
+              // Ink2TaskPackage is NOT autolinked (autolinking only covers
+              // node_modules), so it has to be added by hand -- and this line is
+              // what actually gets it onto the device. buildPlugin.sh builds
+              // PluginConfig.json's "reactPackages" by parsing THIS file for
+              // add(...Package()) calls (find_manual_react_packages_from_application);
+              // PluginHost then instantiates only what's in that array. Without
+              // this line the module compiles, ships, and is null at runtime.
+              add(Ink2TaskPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

@@ -44,6 +44,10 @@ https://github.com/user-attachments/assets/458fa3e2-2d6f-4f9a-8660-4f9ea1752949
   task to a new spot in the app moves it here too on the next sync. (Apple
   Reminders has no public API for its manual order, so that one stays in
   creation-date order instead.)
+- **See what a sync is doing** -- tapping the on-page SYNC button shows a small
+  floating status bubble ("Reading the page…", "Saving…") so the device doesn't
+  just look frozen while it works. It's non-interactive, so you can keep
+  writing straight through it.
 - **E-ink friendly by design** -- high contrast, no gradients, minimal
   redraws, and a template page with the SYNC button and layout baked into
   the background so nothing has to be drawn twice.
@@ -51,10 +55,11 @@ https://github.com/user-attachments/assets/458fa3e2-2d6f-4f9a-8660-4f9ea1752949
 ## Project layout
 
 ```
-plugin/               React Native Supernote plugin (builds to a .snplg)
+plugin/                React Native Supernote plugin (builds to a .snplg)
 mac-server/            Swift HTTP server, Apple Reminders via EventKit
 google-tasks-server/   Node/TypeScript HTTP server, Google Tasks
 todoist-server/        Node/TypeScript HTTP server, Todoist (optional -- see below)
+.claude/skills/        Supernote plugin-dev reference for Claude Code (see below)
 ```
 
 Each has its own README with build/setup details:
@@ -213,3 +218,46 @@ Key pieces:
   (`/health`, `/lists`, `/reminders`, `/complete`, `/uncomplete`) implemented
   by three interchangeable servers, plus a direct-to-Todoist client that
   skips the server entirely.
+- **Sync-progress overlay** (`android/.../Ink2TaskOverlayModule.kt`) -- a custom
+  Android NativeModule that draws a floating status bubble with
+  `TYPE_APPLICATION_OVERLAY`. The JS SDK can't do this: `showPluginView()` takes
+  no arguments and only opens fullscreen, so an on-page sync used to run ~18s
+  with nothing on screen. The bubble is deliberately `FLAG_NOT_TOUCHABLE` so pen
+  and finger input pass straight through to the note underneath.
+
+## Developing with Claude Code
+
+This repo was built with [Claude Code](https://claude.com/claude-code), and
+carries a skill at `.claude/skills/supernote-plugin-dev/` so future sessions
+start with the SDK's API surface and constraints already to hand instead of
+rediscovering them.
+
+The skill is vendored from [AgP42/supernote-dashboard](https://github.com/AgP42/supernote-dashboard)
+(see Credits). Its `SKILL.md` opens with an **Ink2Task local corrections**
+block, because a few of its rules are wrong for this codebase -- most
+importantly its advice to call `saveCurrentNote()` *before* `replaceElements`,
+which on our redraw path silently leaves the user's handwriting behind. That
+was a bug which took roughly ten build-and-test cycles on real hardware to
+track down, so the correction is worth keeping in front of anyone (human or
+model) reading the skill.
+
+## Credits
+
+- **[SuperTask](https://github.com/apclark31/supernote-plugin-research/tree/main/plugins/SuperTask)**
+  by [@apclark31](https://github.com/apclark31) -- the plugin that inspired
+  Ink2Task, and the reference for how a Supernote plugin is structured, built,
+  and packaged. Ink2Task takes a deliberately different shape (one dedicated
+  checklist note you write on, rather than a task-manager UI inside the
+  plugin), but it exists because SuperTask showed it was possible.
+- **[AgP42/supernote-dashboard](https://github.com/AgP42/supernote-dashboard)**
+  (MIT) -- source of the vendored `supernote-plugin-dev` skill. Its notes on
+  element recycling fixed a native memory leak here, and its floating-window
+  pattern is the basis of the sync-progress overlay.
+- **[Laumss/Inkling](https://github.com/Laumss/Inkling)** (MIT) -- the skill's
+  original author, via supernote-dashboard.
+- **[Ratta Supernote](https://supernote.com)** -- for the
+  [`sn-plugin-lib` SDK](https://docs.supernote.com/en) and the plugin system
+  that makes any of this possible.
+
+Upstream licenses are preserved alongside the vendored files
+(`.claude/skills/supernote-plugin-dev/LICENSE-upstream.txt`).
