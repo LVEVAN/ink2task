@@ -16,7 +16,9 @@ Download the plugin directly here: https://github.com/LVEVAN/ink2task/releases
 
 
 
-https://github.com/user-attachments/assets/458fa3e2-2d6f-4f9a-8660-4f9ea1752949
+
+https://github.com/user-attachments/assets/f8f735c9-a9c2-4331-af06-d9e6e91994d2
+
 
 
 
