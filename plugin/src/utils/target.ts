@@ -83,7 +83,7 @@ export async function resolveTarget(config: Ink2TaskConfig): Promise<Target> {
  * Ink2Task note itself, that's unambiguous -- use the page you're on, same as
  * resolveTarget. Otherwise (the normal case: lassoing text on some OTHER
  * note), fall back to the pinned lassoTargetOverride if set, else whichever
- * page was last synced, else page 0 -- so captures follow whichever list is
+ * page was last VIEWED, else page 0 -- so captures follow whichever list is
  * actively in use rather than always landing on page 0 regardless.
  */
 export async function resolveLassoTarget(config: Ink2TaskConfig): Promise<{notePath: string; page: number}> {
@@ -98,7 +98,7 @@ export async function resolveLassoTarget(config: Ink2TaskConfig): Promise<{noteP
     const page = await unwrap<number>(PluginCommAPI.getCurrentPageNum(), 'getCurrentPageNum');
     return {notePath, page: typeof page === 'number' ? page : FIRST_PAGE};
   }
-  const fallback = config.lassoTargetOverride || config.lastSyncedPage;
+  const fallback = config.lassoTargetOverride || config.lastViewedPage;
   return fallback
     ? {notePath: toAbsolute(fallback.notePath), page: fallback.page}
     : {notePath, page: FIRST_PAGE};

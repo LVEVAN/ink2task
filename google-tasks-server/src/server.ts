@@ -44,14 +44,26 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Json> {
   return JSON.parse(raw) as Json;
 }
 
-/** First non-internal IPv4 address, to print a reachable URL at startup. */
-function likelyLanAddress(): string | undefined {
-  for (const addrs of Object.values(networkInterfaces())) {
+type LanCandidate = {name: string; address: string};
+
+// Interface names for VPNs, containers, and virtual bridges -- these commonly
+// sort before the real Wi-Fi/Ethernet adapter but aren't reachable from
+// another device on the LAN. A host running Docker, Tailscale, or a VPN
+// client (common on a Pi or Windows PC) can easily have one of these listed
+// first, which used to make the startup banner print an address the plugin
+// could never reach.
+const VIRTUAL_IFACE = /^(docker|br-|veth|virbr|tailscale|wg|tun|utun|vEthernet|VirtualBox|Loopback)/i;
+
+/** Every non-internal IPv4 address on this host, real LAN adapters first. */
+function lanCandidates(): LanCandidate[] {
+  const candidates: LanCandidate[] = [];
+  for (const [name, addrs] of Object.entries(networkInterfaces())) {
     for (const addr of addrs ?? []) {
-      if (addr.family === 'IPv4' && !addr.internal) return addr.address;
+      if (addr.family === 'IPv4' && !addr.internal) candidates.push({name, address: addr.address});
     }
   }
-  return undefined;
+  candidates.sort((a, b) => Number(VIRTUAL_IFACE.test(a.name)) - Number(VIRTUAL_IFACE.test(b.name)));
+  return candidates;
 }
 
 async function main(): Promise<void> {
@@ -147,9 +159,18 @@ async function main(): Promise<void> {
   });
 
   server.listen(config.port, () => {
-    const host = likelyLanAddress() ?? '<this-host>';
+    const candidates = lanCandidates();
+    const host = candidates[0]?.address ?? '<this-host>';
     console.log('');
     console.log(`Listening on http://${host}:${config.port}`);
+    if (candidates.length > 1) {
+      console.log('(Other addresses found on this machine -- try one of these');
+      console.log(' instead if the Supernote can\'t reach the one above:');
+      for (const c of candidates.slice(1)) {
+        console.log(`   http://${c.address}:${config.port}  (${c.name})`);
+      }
+      console.log(')');
+    }
     console.log("Put that address into Ink2Task's settings on your Supernote.");
     console.log('Config file: ' + CONFIG_FILE);
     console.log('Press Ctrl+C to stop.');

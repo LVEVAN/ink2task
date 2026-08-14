@@ -75,11 +75,16 @@ const DUE_TEXT_LEFT = 1184 / TPL_W; // start after the divider (1164)
 const DUE_TEXT_RIGHT = 1304 / TPL_W; // right margin unchanged
 const FONT_SIZE = 40 / TPL_H; // base; scaled by the user's list-size setting
 
-// The header label ("<platform> · <list>") drawn in the empty band between the
-// SYNC button (ends ~x418) and the "DUE" word (starts ~x1164), so you can see
-// at a glance which backend + list this page syncs.
-const HEADER_LABEL_LEFT = 370 / TPL_W;
-const HEADER_LABEL_RIGHT = 990 / TPL_W;
+// The header label ("<platform> · <list>") drawn in the ruled-line margin
+// (x85), the SYNC button's old spot before the two swapped (2026-08-13,
+// device request): SYNC is now centered (x556..848, see template.svg), so
+// the title moved here to make room. RIGHT runs almost up to the pill's
+// left edge (556), just a 6px gap -- widened from an initial 530 after
+// device feedback: "TODOIST - INBOX" was JUST missing the one-line-fit
+// threshold at that width (445px; needed ~452px) and fell back to the
+// stacked two-line layout unnecessarily. 465px clears it with margin.
+const HEADER_LABEL_LEFT = 85 / TPL_W;
+const HEADER_LABEL_RIGHT = 550 / TPL_W;
 const HEADER_LABEL_TOP = 104 / TPL_H;
 const HEADER_LABEL_BOTTOM = 188 / TPL_H;
 const HEADER_FONT = 46 / TPL_H; // match the template's "DUE" header size
@@ -142,11 +147,27 @@ const RULE_COLOR = 0x9d;
 
 // "+N more" note in the bottom margin, shown when the list is longer than the
 // page's N_ROWS. They surface as you complete tasks above (the list compacts).
+// Shrunk slightly from the original 1790..1858/font 34 to make room for
+// LAST_UPDATED below it -- the blank margin below the ruled table (1773..1872,
+// 99px) has to fit both.
 const FOOTER_LEFT = 100 / TPL_W;
 const FOOTER_RIGHT = 1304 / TPL_W;
-const FOOTER_TOP = 1790 / TPL_H;
-const FOOTER_BOTTOM = 1858 / TPL_H;
-const FOOTER_FONT = 34 / TPL_H;
+const FOOTER_TOP = 1778 / TPL_H;
+const FOOTER_BOTTOM = 1808 / TPL_H;
+const FOOTER_FONT = 26 / TPL_H;
+
+// "UPDATED: <date/time>" -- small, BOLD, centered across the FULL page
+// width (both columns), in the blank strip below the footer. Drawn fresh on
+// every redraw, so it's simply "now" at the moment writeChecklist runs --
+// ported from Ink2Day's dailyPage.ts, which draws the same thing the same way
+// (native page element, not a Settings-screen overlay, so it survives closing
+// Settings and shows up right on the note itself). Nudged up twice from the
+// original 1834..1866 per device feedback (2026-08-11), to line up with the
+// device's own "<note name> / page N" footer row -- the footer above it
+// (shrunk slightly) moved up in step to keep clearance.
+const LAST_UPDATED_TOP = 1812 / TPL_H;
+const LAST_UPDATED_BOTTOM = 1844 / TPL_H;
+const LAST_UPDATED_FONT = 22 / TPL_H;
 
 type PageSize = {width: number; height: number};
 
@@ -154,6 +175,23 @@ const MONTHS = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ];
+
+/**
+ * "UPDATED: AUG 11, 2:45 PM" (or "AUG 11, 14:45" with use24h) for the
+ * given moment, local wall-clock time.
+ */
+function formatLastUpdated(d: Date, use24h?: boolean): string {
+  const month = MONTHS[d.getMonth()].toUpperCase();
+  const day = d.getDate();
+  const h = d.getHours();
+  const min = String(d.getMinutes()).padStart(2, '0');
+  if (use24h) {
+    return `UPDATED: ${month} ${day}, ${String(h).padStart(2, '0')}:${min}`;
+  }
+  const ampm = h < 12 ? 'AM' : 'PM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `UPDATED: ${month} ${day}, ${h12}:${min} ${ampm}`;
+}
 
 /**
  * Splits a due value into a date line and an (optional) time line, so the
@@ -164,7 +202,7 @@ const MONTHS = [
  * The year is added only when it isn't the current one. Parsed by parts (not
  * through Date) so a date-only value can't shift across a day due to timezone.
  */
-function formatDueParts(due: string): {date: string; time: string} {
+function formatDueParts(due: string, use24h?: boolean): {date: string; time: string} {
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/.exec(due);
   if (!m) return {date: due, time: ''};
   const year = Number(m[1]);
@@ -176,10 +214,14 @@ function formatDueParts(due: string): {date: string; time: string} {
   if (m[4] != null && m[5] != null) {
     const h = Number(m[4]);
     const min = Number(m[5]);
-    const ampm = h < 12 ? 'AM' : 'PM';
-    const h12 = h % 12 === 0 ? 12 : h % 12;
-    const mm = min === 0 ? '' : `:${String(min).padStart(2, '0')}`;
-    time = `${h12}${mm} ${ampm}`;
+    if (use24h) {
+      time = `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+    } else {
+      const ampm = h < 12 ? 'AM' : 'PM';
+      const h12 = h % 12 === 0 ? 12 : h % 12;
+      const mm = min === 0 ? '' : `:${String(min).padStart(2, '0')}`;
+      time = `${h12}${mm} ${ampm}`;
+    }
   }
   return {date, time};
 }
@@ -276,6 +318,24 @@ export type ChecklistStyle = {
    * See the `ordered` sort below.
    */
   honorBackendOrder?: boolean;
+  /**
+   * 24-hour ("military") time instead of 12-hour AM/PM, for every time this
+   * module draws on the page: due times in the DUE column and the LAST
+   * UPDATED footer. Off (12-hour) by default, matching how the checklist
+   * has always looked.
+   */
+  use24HourTime?: boolean;
+  /**
+   * Whether THIS note's background already has the checkbox outlines baked
+   * in (see ensureNote.ts's noteHasBakedInCheckboxes) -- when true AND this
+   * is the template page (drawChrome is false), drawCheckbox skips creating
+   * the outline as an element, since the background already shows it. Real
+   * per-sync saving found via adb logcat timing (2026-08-12): ~14 fewer
+   * native element writes, each measured at roughly 50-100ms. Defaults to
+   * false (draw them) when omitted -- the always-correct fallback for any
+   * note whose background doesn't actually have them.
+   */
+  checkboxesBaked?: boolean;
 };
 
 // Rectangle outline pen width for checkboxes and blank writable boxes.
@@ -292,6 +352,12 @@ export async function writeChecklist(
   const layer = await checklistLayer(notePath, page);
   const scale = style.scale && style.scale > 0 ? style.scale : 1;
   const fontPath = style.fontPath || '';
+  const use24h = !!style.use24HourTime;
+  // Only skip drawing checkbox elements when BOTH this note's background
+  // actually has them baked in AND we're drawing the TEMPLATE page itself
+  // (drawChrome false) -- any other page (added by hand, no baked-in
+  // background at all) still needs them drawn regardless of this flag.
+  const skipCheckboxElement = !!style.checkboxesBaked && !style.drawChrome;
 
   // EVERY note type is now wiped-and-redrawn in ONE call by replaceElements at the
   // end (that also erases the user's handwriting), so no separate clear is needed
@@ -494,7 +560,12 @@ export async function writeChecklist(
   const drawCheckbox = async (rowTop: number) => {
     const bTop = rowTop + boxTopInRow;
     const box = {left: boxLeft, top: bTop, right: boxLeft + boxSize, bottom: bTop + boxSize};
-    elementPromises.push(mkRect(box.left, box.top, box.right, box.bottom));
+    // The box's COORDINATES are always computed and returned regardless --
+    // capture.ts needs them to know where to look for a checkmark stroke,
+    // whether or not the outline itself is drawn as an element here.
+    if (!skipCheckboxElement) {
+      elementPromises.push(mkRect(box.left, box.top, box.right, box.bottom));
+    }
     return box;
   };
 
@@ -526,7 +597,7 @@ export async function writeChecklist(
 
   const drawDue = async (rowTop: number, due?: string | null) => {
     if (!due) return;
-    const {date, time} = formatDueParts(due);
+    const {date, time} = formatDueParts(due, use24h);
     const lineH = dueFontSize + Math.round(dueFontSize * 0.35);
     const groupH = time ? lineH * 2 : lineH;
     const gTop = rowTop + Math.round((rowHeight - groupH) / 2);
@@ -571,12 +642,16 @@ export async function writeChecklist(
   // vertical center (the SYNC box's midline) so they sit on the same line no
   // matter their font size, and SYNC lands centered inside its box.
   const headingMid = py(HEADING_CENTER);
+  // Only ever called for the platform:list title (its one call site, below) --
+  // left-aligned (align=0) so it starts flush at the left ruled-line margin
+  // (device request, 2026-08-14) rather than floating centered within its
+  // now-wide box, which read as oddly indented once that box was widened.
   const drawHeading = async (text: string, leftF: number, rightF: number, fontFrac: number) => {
     const fs = Math.round(size.height * fontFrac);
     const top = headingMid - Math.round(fs / 2);
     // Text is top-aligned and clips at the rect bottom, so add descender room.
     const bottom = top + fs + Math.round(fs * 0.4);
-    elementPromises.push(mkText(text, px(leftF), px(rightF), top, bottom, fs, 1, 1));
+    elementPromises.push(mkText(text, px(leftF), px(rightF), top, bottom, fs, 0, 1));
   };
 
   if (style.drawChrome) {
@@ -621,13 +696,13 @@ export async function writeChecklist(
       elementPromises.push(
         mkText(
           header.platform.toUpperCase(), px(HEADER_LABEL_LEFT), px(HEADER_LABEL_RIGHT),
-          line1Top, line1Top + lineH2, fs2, 1, 1,
+          line1Top, line1Top + lineH2, fs2, 0, 1,
         ),
       );
       elementPromises.push(
         mkText(
           header.list.toUpperCase(), px(HEADER_LABEL_LEFT), px(HEADER_LABEL_RIGHT),
-          line2Top, line2Top + lineH2, fs2, 1, 1,
+          line2Top, line2Top + lineH2, fs2, 0, 1,
         ),
       );
     }
@@ -711,6 +786,22 @@ export async function writeChecklist(
       ),
     );
   }
+
+  // "UPDATED: <date/time>" -- bottom center of the FULL page (both
+  // columns), small and out of the way. Drawn every redraw, so it's simply
+  // whatever "now" is at the moment this sync writes the page.
+  elementPromises.push(
+    mkText(
+      formatLastUpdated(new Date(), use24h),
+      0,
+      size.width,
+      py(LAST_UPDATED_TOP),
+      py(LAST_UPDATED_BOTTOM),
+      Math.round(size.height * LAST_UPDATED_FONT),
+      1, // center
+      1, // bold
+    ),
+  );
 
   // Resolve every createElement round-trip AT ONCE (they were queued above but
   // not awaited), so ~66 native calls pipeline instead of running serially.

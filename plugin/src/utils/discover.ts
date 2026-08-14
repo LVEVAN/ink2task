@@ -74,7 +74,7 @@ export async function candidateSubnets(): Promise<string[]> {
 }
 
 /** Well-known ports the backends default to; scanned alongside the current one. */
-const KNOWN_PORTS = [8942, 8943, 8944];
+const KNOWN_PORTS = [8942, 8943, 8944, 8955]; // 8955 = ticktick-server
 
 export type Found = {host: string; port: number};
 

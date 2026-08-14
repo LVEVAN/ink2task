@@ -16,7 +16,8 @@ import {PluginCommAPI, PluginFileAPI, PluginNoteAPI, Element} from 'sn-plugin-li
 import {unwrap, recycleElements} from './sdk';
 import {emrToScreen} from './checklistPage';
 import {loadConfig, effectiveConfigForPage, saveTaskSource} from './config';
-import {resolveLassoTarget, isNoteOpen} from './target';
+import {resolveLassoTarget, isNoteOpen, FIRST_PAGE} from './target';
+import type {Target} from './target';
 import {toAbsolute} from './notePicker';
 import {parseDueDate} from './dateParse';
 import {createReminder} from '../api/macServer';
@@ -27,10 +28,16 @@ type Rect = {left: number; top: number; right: number; bottom: number};
 /**
  * Reads the current lasso selection, OCRs it (or uses native typed text
  * directly, no OCR needed), and creates a reminder from the result. Returns
- * the created task's title, or null if there was nothing to add (empty
- * selection, or nothing recognizable in it).
+ * the created task's title AND the exact page it was written to (as a
+ * `Target`, ready to hand straight to `syncThenFetch`'s `target` option) --
+ * or null if there was nothing to add (empty selection, or nothing
+ * recognizable in it).
+ *
+ * The caller MUST reuse this `target` for the redraw that follows, rather
+ * than re-resolving one independently -- see syncThenFetch's doc for why a
+ * second resolve can land on a different page than this one did.
  */
-export async function addLassoedTaskToInk2Task(): Promise<string | null> {
+export async function addLassoedTaskToInk2Task(): Promise<{title: string; target: Target} | null> {
   const lassoRes = await unwrap<any[]>(PluginCommAPI.getLassoElements(), 'getLassoElements');
   const elements = lassoRes || [];
   if (elements.length === 0) {
@@ -104,7 +111,11 @@ export async function addLassoedTaskToInk2Task(): Promise<string | null> {
   // Drop a link on the SOURCE note pointing at the checklist, so the two are
   // navigable in both directions.
   await insertBackLink(srcPath, srcPage, notePath, page, lassoRect, id);
-  return title;
+  // isOpen is irrelevant here -- the redraw this feeds never checks it (lasso
+  // capture deliberately omits requireOpenNote, see syncThenFetch's doc).
+  // isTemplatePage mirrors resolveTarget's own rule: only page 0 has the
+  // background baked in.
+  return {title, target: {notePath, page, isTemplatePage: page === FIRST_PAGE, isOpen: false}};
 }
 
 /**

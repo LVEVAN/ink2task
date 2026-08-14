@@ -23,9 +23,14 @@ const SOURCES_FILE = `${CONFIG_DIR}/task-sources.json`;
 // Fingerprints of ink each page's last sync erased -- used to ignore strokes the
 // host restores when the plugin is reinstalled. See loadErasedInk.
 const ERASED_INK_FILE = `${CONFIG_DIR}/erased-ink.json`;
-// The plugin version the last sync ran under, so a sync can tell it's the first
-// one after an install. See loadSyncedVersion.
-const INSTALL_FILE = `${CONFIG_DIR}/install-state.json`;
+// TickTick-specific two-way sync bookkeeping -- see ticktickSync.ts. Kept as
+// its OWN files rather than folded into the registry: they track per-task
+// change-detection state (what we last synced) and a pending-mutation outbox,
+// neither of which any other backend needs, so this stays purely additive.
+const TICKTICK_SYNC_STATE_FILE = `${CONFIG_DIR}/ticktick-sync-state.json`;
+const TICKTICK_OUTBOX_FILE = `${CONFIG_DIR}/ticktick-outbox.json`;
+// Last-sync status shown in Settings -- see TickTickSyncMeta below.
+const TICKTICK_META_FILE = `${CONFIG_DIR}/ticktick-sync-meta.json`;
 
 // The plugin was formerly called "SuperRemind"; its settings + registry lived
 // here. On first run under the new name we copy them across (see migrateLegacy),
@@ -44,7 +49,7 @@ export type ConnectionProfile = {
   /** Short label shown on the switcher, e.g. "Apple Reminders" or "Google Tasks". */
   label: string;
   /** Which backend this profile expects, so Wi-Fi discovery finds the right server. */
-  backend: 'apple' | 'google' | 'todoist';
+  backend: 'apple' | 'google' | 'todoist' | 'ticktick';
   host: string;
   port: number;
   listName: string;
@@ -73,6 +78,26 @@ export type Ink2TaskConfig = {
   /** Scales the whole checklist (text, checkboxes, rows). 1 = default size. */
   listScale: number;
   /**
+   * 24-hour ("military") time instead of 12-hour AM/PM for every time drawn
+   * on the checklist page (DUE times, LAST UPDATED). Off (12-hour) by
+   * default. Optional/undefined behaves as false, so existing configs from
+   * before this setting existed don't need migrating.
+   */
+  use24HourTime?: boolean;
+  /**
+   * Whether the on-page SYNC button (index.js's global motion listener) is
+   * active. On (undefined behaves as true) by default. Off lets a user who's
+   * hit the "fires a sync while exiting to the note picker" issue eliminate
+   * it entirely -- the underlying cause is a confirmed Supernote SDK gap
+   * (no signal exists to tell "genuinely on this note" from "coordinates
+   * happen to match", see [[ink2task-sdk-gotchas]]), so this is the only
+   * complete fix; a smaller/stricter zone only reduces the odds. Disabling
+   * it leaves the Settings screen's "Sync tasks" button as the only way to
+   * sync, which has none of this ambiguity (it only runs while that screen
+   * is genuinely open).
+   */
+  onPageSyncEnabled?: boolean;
+  /**
    * Which profile+list each PAGE of the note syncs, keyed by
    * `${notePath}#${page}` -- so adding a page (via the device's own note
    * tools) and syncing it gives that page its own backend/list, independent
@@ -81,14 +106,18 @@ export type Ink2TaskConfig = {
    */
   pageBindings?: {[key: string]: PageBinding};
   /**
-   * The page most recently synced (on-page button or the Settings screen).
-   * Lasso capture (from ANY other note) defaults new tasks here instead of
-   * always page 0, so it follows whichever list you're actively using.
+   * The page most recently VIEWED (on-page button tap or the Settings
+   * screen's Sync button -- the only moments this plugin can confirm which
+   * page you're on, see resolveTarget). Lasso capture (from ANY other note)
+   * defaults new tasks here instead of always page 0, so it follows
+   * whichever list you're actively using. Deliberately not tied to a sync
+   * actually completing -- it's set as soon as the page is confirmed, even
+   * if the sync that follows fails or is skipped.
    */
-  lastSyncedPage?: PageRef;
+  lastViewedPage?: PageRef;
   /**
-   * Pins lasso captures to a specific page/list, overriding lastSyncedPage.
-   * Set from Settings; absent/null means "off" (use lastSyncedPage).
+   * Pins lasso captures to a specific page/list, overriding lastViewedPage.
+   * Set from Settings; absent/null means "off" (use lastViewedPage).
    */
   lassoTargetOverride?: PageRef | null;
 };
@@ -106,6 +135,7 @@ const DEFAULT_CONFIG: Ink2TaskConfig = {
     {label: 'Apple Reminders', backend: 'apple', host: '192.168.1.0', port: 8942, listName: 'Inbox'},
     {label: 'Google Tasks', backend: 'google', host: '', port: 8943, listName: 'Inbox'},
     {label: 'Todoist', backend: 'todoist', host: '', port: 8944, listName: 'Inbox'},
+    {label: 'TickTick', backend: 'ticktick', host: '192.168.1.0', port: 8955, listName: 'Inbox'},
   ],
   activeProfile: 0,
   notePath: '/Note/Ink2Task/Ink2Task.note',
@@ -181,6 +211,7 @@ const PROFILE_DEFAULTS: ConnectionProfile[] = [
   {label: 'Apple Reminders', backend: 'apple', host: '192.168.1.0', port: 8942, listName: 'Inbox'},
   {label: 'Google Tasks', backend: 'google', host: '', port: 8943, listName: 'Inbox'},
   {label: 'Todoist', backend: 'todoist', host: '', port: 8944, listName: 'Inbox'},
+  {label: 'TickTick', backend: 'ticktick', host: '192.168.1.0', port: 8955, listName: 'Inbox'},
 ];
 
 function normalizeProfiles(config: Ink2TaskConfig): Ink2TaskConfig {
@@ -239,6 +270,30 @@ export function switchProfile(config: Ink2TaskConfig, index: number): Ink2TaskCo
     port: target.port,
     listName: target.listName,
   };
+}
+
+/**
+ * Replaces a stale host:port (e.g. the Mac's LAN IP changed via DHCP) with a
+ * freshly-discovered one, across every profile that shared the stale
+ * address -- not just the active one, in case two profiles pointed at the
+ * same machine (e.g. mac-server and google-tasks-server side by side).
+ * Ported from Ink2Day's autoRecover.ts, which added this after a
+ * device-reported sync hang/failure traced to exactly this: config.json
+ * still pointing at an old address with no automatic way to notice.
+ */
+export function replaceStaleServerAddress(
+  config: Ink2TaskConfig,
+  staleHost: string,
+  stalePort: number,
+  freshHost: string,
+  freshPort: number,
+): Ink2TaskConfig {
+  const matches = (h: string, p: number) => h === staleHost && p === stalePort;
+  const profiles = config.profiles.map(p =>
+    matches(p.host, p.port) ? {...p, host: freshHost, port: freshPort} : p,
+  );
+  const top = matches(config.host, config.port) ? {host: freshHost, port: freshPort} : {};
+  return {...config, ...top, profiles};
 }
 
 export async function saveConfig(config: Ink2TaskConfig): Promise<void> {
@@ -397,13 +452,13 @@ export function bindPage(
   };
 }
 
-/** Records the page a sync just completed on -- see `lastSyncedPage`. */
-export function withLastSyncedPage(
+/** Records the page just confirmed as viewed -- see `lastViewedPage`. */
+export function withLastViewedPage(
   config: Ink2TaskConfig,
   notePath: string,
   page: number,
 ): Ink2TaskConfig {
-  return {...config, lastSyncedPage: {notePath, page}};
+  return {...config, lastViewedPage: {notePath, page}};
 }
 
 /** Pins (or, with `null`, un-pins) the lasso-capture target -- see `lassoTargetOverride`. */
@@ -480,38 +535,6 @@ export async function saveErasedInk(key: string, prints: {x: number; y: number}[
 }
 
 /**
- * The plugin version that last completed a sync, or '' if none has.
- *
- * Installing the plugin makes the host revert its page edits, bringing back ink
- * a previous sync erased -- including old checkmarks. The fingerprint filter
- * (loadErasedInk) catches that, but not on a page whose fingerprints predate
- * this mechanism or were never recorded. Comparing this against the running
- * version identifies the FIRST sync after an install, which treats whatever ink
- * is on the page as stale: erase it, don't act on it.
- *
- * Deliberately a version string rather than a "have we run before" flag -- that
- * would also trip on an ordinary device restart, silently discarding real
- * handwriting the user hadn't synced yet.
- */
-export async function loadSyncedVersion(): Promise<string> {
-  try {
-    if (!(await RNFS.exists(INSTALL_FILE))) return '';
-    return JSON.parse(await RNFS.readFile(INSTALL_FILE, 'utf8'))?.version || '';
-  } catch {
-    return '';
-  }
-}
-
-export async function saveSyncedVersion(version: string): Promise<void> {
-  try {
-    await ensureDir();
-    await RNFS.writeFile(INSTALL_FILE, JSON.stringify({version}), 'utf8');
-  } catch (e) {
-    console.log('Ink2Task: install-state save failed', e);
-  }
-}
-
-/**
  * Writes the whole source map back. Used by the back-link reconcile in
  * actions.ts, which has to remove the links from their notes BEFORE dropping
  * the records that say where those notes are. That reconcile deliberately does
@@ -525,5 +548,140 @@ export async function saveTaskSources(all: TaskSources): Promise<void> {
     await RNFS.writeFile(SOURCES_FILE, JSON.stringify(all, null, 2), 'utf8');
   } catch (e) {
     console.log('Ink2Task: task-sources save failed', e);
+  }
+}
+
+// -----------------------------------------------------------------------
+// TickTick two-way sync bookkeeping. See src/utils/ticktickSync.ts for the
+// decision logic that reads/writes these; this file only owns persistence,
+// matching every other loadX/saveX pair above.
+// -----------------------------------------------------------------------
+
+/**
+ * Per-task change-detection state, as of the last successful sync.
+ *
+ * `lastSyncedEtag` is what makes conflict detection possible at all: TickTick
+ * tasks have no modified-time field (confirmed absent across every source
+ * checked), but `etag` DOES change on every mutation -- device-verified
+ * 2026-08-11 (an update visibly changed a task's etag). Comparing the
+ * CURRENT remote etag against this tells us "has this task changed on
+ * TickTick's side since we last looked," independent of what changed.
+ *
+ * `lastSyncedDue` is separate from the etag check: it's what lets the ONE
+ * real local-edit path in this UI today (handwriting a new date into an
+ * already-synced row's DUE box) tell "the user just wrote something new"
+ * apart from "the box still shows what we drew last time." Etag comparison
+ * alone can't do that -- it only speaks to the REMOTE side.
+ */
+export type TickTickSyncRecord = {
+  reminderId: string;
+  lastSyncedEtag?: string;
+  /** Plugin date format ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM"), or absent. */
+  lastSyncedDue?: string;
+};
+
+export type TickTickSyncState = {[reminderId: string]: TickTickSyncRecord};
+
+const TICKTICK_SYNC_STATE_DEFAULT: TickTickSyncState = {};
+
+export async function loadTicktickSyncState(): Promise<TickTickSyncState> {
+  try {
+    if (!(await RNFS.exists(TICKTICK_SYNC_STATE_FILE))) return {...TICKTICK_SYNC_STATE_DEFAULT};
+    return JSON.parse(await RNFS.readFile(TICKTICK_SYNC_STATE_FILE, 'utf8'));
+  } catch (e) {
+    console.log('Ink2Task: ticktick-sync-state load failed', e);
+    return {...TICKTICK_SYNC_STATE_DEFAULT};
+  }
+}
+
+export async function saveTicktickSyncState(state: TickTickSyncState): Promise<void> {
+  try {
+    await ensureDir();
+    await RNFS.writeFile(TICKTICK_SYNC_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  } catch (e) {
+    console.log('Ink2Task: ticktick-sync-state save failed', e);
+  }
+}
+
+/**
+ * A mutation that couldn't reach ticktick-server (network error, not TickTick
+ * rejecting the request -- see classifyTicktickError in ticktickSync.ts),
+ * queued for the next sync to retry. See requirement: "handle offline use
+ * gracefully" -- this is the durable half of that; ticktickSync.ts's
+ * drainOutbox is the retry half.
+ *
+ * Deliberately covers only the actions this UI can actually trigger today
+ * (complete/uncomplete via check-off, setDue via the handwritten DUE box,
+ * delete for future use) plus a generic `update` for forward-compatibility
+ * with a future title/notes/priority editing UI -- see the scoping note in
+ * ticktickSync.ts for why those don't have a local trigger yet.
+ *
+ * No projectId: ticktick-server resolves by LIST NAME (config.listName), not
+ * by id, so draining just needs whatever config is active at drain time --
+ * same as every other call this plugin makes to a companion server.
+ */
+export type TickTickOutboxEntry = {
+  /** Local id for de-duplication -- see enqueueTicktickOutbox. */
+  id: string;
+  kind: 'complete' | 'uncomplete' | 'setDue' | 'delete' | 'update';
+  reminderId: string;
+  payload?: {title?: string; notes?: string; due?: string | null; priority?: 1 | 2 | 3 | 4};
+  queuedAt: number;
+};
+
+export type TickTickOutbox = TickTickOutboxEntry[];
+
+export async function loadTicktickOutbox(): Promise<TickTickOutbox> {
+  try {
+    if (!(await RNFS.exists(TICKTICK_OUTBOX_FILE))) return [];
+    return JSON.parse(await RNFS.readFile(TICKTICK_OUTBOX_FILE, 'utf8'));
+  } catch (e) {
+    console.log('Ink2Task: ticktick-outbox load failed', e);
+    return [];
+  }
+}
+
+export async function saveTicktickOutbox(outbox: TickTickOutbox): Promise<void> {
+  try {
+    await ensureDir();
+    await RNFS.writeFile(TICKTICK_OUTBOX_FILE, JSON.stringify(outbox, null, 2), 'utf8');
+  } catch (e) {
+    console.log('Ink2Task: ticktick-outbox save failed', e);
+  }
+}
+
+/**
+ * "Last successful sync time and any useful error message" for the TickTick
+ * Settings section -- the one persisted status surface none of the other
+ * three backends have today (they only show a transient status line that
+ * resets when you leave the screen). Written after every TickTick sync
+ * attempt (success or not), read by Home.tsx to render it.
+ */
+export type TickTickSyncMeta = {
+  /** Epoch ms of the last sync ATTEMPT that completed (didn't crash) --
+   * updated even when lastError is set, since a sync that ran and reported
+   * warnings still ran, and "when did this last try" is worth showing either way. */
+  lastSyncAt?: number;
+  /** Human-readable summary of the last sync's warnings, if any. Cleared
+   * (undefined) on a sync that completed with nothing to report. */
+  lastError?: string;
+};
+
+export async function loadTicktickSyncMeta(): Promise<TickTickSyncMeta> {
+  try {
+    if (!(await RNFS.exists(TICKTICK_META_FILE))) return {};
+    return JSON.parse(await RNFS.readFile(TICKTICK_META_FILE, 'utf8'));
+  } catch (e) {
+    console.log('Ink2Task: ticktick-sync-meta load failed', e);
+    return {};
+  }
+}
+
+export async function saveTicktickSyncMeta(meta: TickTickSyncMeta): Promise<void> {
+  try {
+    await ensureDir();
+    await RNFS.writeFile(TICKTICK_META_FILE, JSON.stringify(meta, null, 2), 'utf8');
+  } catch (e) {
+    console.log('Ink2Task: ticktick-sync-meta save failed', e);
   }
 }

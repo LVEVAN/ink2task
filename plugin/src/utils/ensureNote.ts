@@ -18,6 +18,18 @@ import {TEMPLATE_PNG_BASE64} from './templateAsset';
 const TEMPLATE = '/MyStyle/Ink2Task/Ink2Task_Template.png';
 const TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Template.version';
 const OLD_TEMPLATE = '/MyStyle/Ink2Task_Template.png';
+// Which template version the CURRENT note (at config.notePath) was actually
+// CREATED from -- NOT the same thing as TEMPLATE_VERSION above, which only
+// tracks the template PNG FILE on disk. Rewriting that file (ensureTemplate,
+// below) does nothing to a note that already exists -- createNote bakes the
+// template into the note's background ONCE, and there is no API to change a
+// note's background after the fact (device-confirmed, see
+// [[ink2task-sdk-gotchas]]). So an existing note keeps whatever background it
+// was created with regardless of how many times the shipped template changes.
+// This file is the only reliable record of what THIS note actually has baked
+// in; see checklistPage.ts's use of it (via getNoteTemplateVersion) to decide
+// whether it's safe to skip drawing checkboxes as elements.
+const NOTE_TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Note.version';
 
 // Bump whenever the embedded template PNG design changes, so devices that
 // already have an older copy get the new one rewritten on the next run.
@@ -30,7 +42,23 @@ const OLD_TEMPLATE = '/MyStyle/Ink2Task_Template.png';
 //   v8 - SYNC button left-aligned with the checkbox column
 //   v9 - SYNC button pushed to the left page edge
 //   v10 - SYNC button left edge aligned with the ruled-line margin
-const TEMPLATE_VERSION = '10';
+//   v11 - checkboxes baked into the background (see CHECKBOX_BAKE_VERSION)
+//   v12 - baked-in checkboxes thinned to stroke-width 2, matching the DUE
+//         box/ruled-line/divider weight (were stroke-width 4, too thick)
+//   v13 - "DUE" header baseline aligned with SYNC's (was 3px high)
+//   v14 - SYNC button and platform:list title swapped: SYNC now centered
+//         in the top row, title moved to SYNC's old left spot
+const TEMPLATE_VERSION = '14';
+
+/**
+ * The template version at which checkboxes were added to the baked-in
+ * background. checklistPage.ts skips drawing them as elements (a real sync-
+ * time saving -- see the change log) ONLY on a note whose OWN recorded
+ * creation version (getNoteTemplateVersion) is at least this, so an existing
+ * note created before this change keeps drawing them as elements -- exactly
+ * as it does today -- until it's recreated against the new template.
+ */
+export const CHECKBOX_BAKE_VERSION = 11;
 
 /**
  * Makes sure the template PNG exists on the device and matches the version this
@@ -101,5 +129,33 @@ export async function ensureNote(notePath: string): Promise<boolean> {
     }
     throw new Error(`Could not create ${notePath} (${code}): ${message}`);
   }
+  // Record which template version this note's background was actually baked
+  // from -- see NOTE_TEMPLATE_VERSION_FILE's comment above. Best-effort, same
+  // reasoning as ensureTemplate's own version-marker write: without it, the
+  // next check just falls back to "assume old template" (still correct, just
+  // draws checkboxes as elements unnecessarily on this one note).
+  try {
+    await RNFS.writeFile(toAbsolute(NOTE_TEMPLATE_VERSION_FILE), TEMPLATE_VERSION, 'utf8');
+  } catch {
+    // non-critical, see above
+  }
   return true;
+}
+
+/**
+ * Whether the CURRENT note (the one at config.notePath) was created from a
+ * template version that already has checkboxes baked into its background --
+ * i.e. whether it's safe to skip drawing them as elements. Reads the marker
+ * ensureNote() writes at creation time; missing/unreadable defaults to false
+ * (draw them, the always-correct fallback) rather than assuming a newer
+ * version than we can actually confirm.
+ */
+export async function noteHasBakedInCheckboxes(): Promise<boolean> {
+  try {
+    const raw = (await RNFS.readFile(toAbsolute(NOTE_TEMPLATE_VERSION_FILE), 'utf8')).trim();
+    const version = parseInt(raw, 10);
+    return Number.isFinite(version) && version >= CHECKBOX_BAKE_VERSION;
+  } catch {
+    return false;
+  }
 }

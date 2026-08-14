@@ -20,7 +20,8 @@ import {toAbsolute} from './src/utils/notePicker';
 import {overlayShow, overlayUpdate, overlayHide} from './src/utils/overlay';
 import {syncThenFetch, formatSyncSummary} from './src/actions';
 import {addLassoedTaskToInk2Task} from './src/utils/lassoCapture';
-import {unwrap} from './src/utils/sdk';
+import {unwrap, withTimeout} from './src/utils/sdk';
+import {acquireBusy, releaseBusy} from './src/utils/busy';
 
 AppRegistry.registerComponent(appName, () => App);
 
@@ -29,22 +30,31 @@ PluginManager.init();
 // ---------------------------------------------------------------------------
 // On-page SYNC button.
 //
-// The "Ink2Task List" template draws a SYNC icon + label in the top-left
-// corner. A background motion listener watches for a tap there (finger or pen)
-// and runs Sync-then-Fetch, so you never have to open the plugin view.
+// The "Ink2Task List" template draws a SYNC icon + label centered in the top
+// row (moved here from the top-left corner 2026-08-13, swapped with the
+// platform:list title -- see template.svg). A background motion listener
+// watches for a tap there (finger or pen) and runs Sync-then-Fetch, so you
+// never have to open the plugin view.
 //
 // Coordinates are screen pixels (the same space getPageSize reports), scaled
 // from the template's 1404x1872 design so the zone tracks the drawn button on
 // any page size. The zone covers the icon AND the word "SYNC".
+//
+// ⚠ This MUST stay in sync with the pill's actual position in template.svg --
+// a stale zone here is a button that looks right and simply never responds
+// to taps (device-confirmed historically when the pill moved and this
+// didn't). If you move the pill again, update this the SAME commit.
 // ---------------------------------------------------------------------------
 const TPL_W = 1404;
 const TPL_H = 1872;
-// Button pill x 85..377 (icon + "SYNC" label), y 100..184 -- padded a little.
-const ZONE = {left: 66 / TPL_W, top: 82 / TPL_H, right: 396 / TPL_W, bottom: 204 / TPL_H};
+// Button pill x 556..848 (icon + "SYNC" label), y 100..184 -- padded a little.
+const ZONE = {left: 537 / TPL_W, top: 82 / TPL_H, right: 867 / TPL_W, bottom: 204 / TPL_H};
 
 let tapStart = null; // where a candidate tap went down
-let busy = false; // an operation is in flight
 let lastFire = 0; // debounce repeated taps
+// The single-flight "an operation is in flight" guard used to be a plain
+// `busy` boolean here -- see acquireBusy/releaseBusy (utils/busy.ts) for
+// why it's now a self-healing wall-clock check instead.
 
 // Capitalize the first letter, so a message reads "Ink2Task: Added ..."
 // rather than "Ink2Task: added ...".
@@ -119,9 +129,23 @@ PluginManager.registerMotionListener(1, {
       // Reject drags/strokes -- a tap barely moves.
       if (Math.hypot(p.x - start.x, p.y - start.y) > 50) return;
 
+      // Settings toggle: lets a user who's hit the "fires while exiting to
+      // the note picker" issue turn this listener off entirely, rather than
+      // live with a false positive that (see the big comment below) has no
+      // real fix. Checked before touching busy/lastFire or any native call,
+      // so "off" costs nothing beyond the one config read. Loaded here (not
+      // re-loaded below) so the rest of this handler reuses the same object.
+      let config;
+      try {
+        config = await loadConfig();
+      } catch (_) {
+        return; // can't confirm the toggle -- fail safe, do nothing
+      }
+      if (config.onPageSyncEnabled === false) return;
+
       const now = Date.now();
-      if (busy || now - lastFire < 2000) return;
-      busy = true;
+      if (now - lastFire < 2000) return;
+      if (!acquireBusy()) return;
       lastFire = now;
       try {
         // Only fire when an actual .note is open. The SYNC button is drawn on
@@ -129,6 +153,28 @@ PluginManager.registerMotionListener(1, {
         // off a sync -- otherwise a stray corner tap runs a network fetch that,
         // offline, fails and (on repeated taps) spams error dialogs. In file
         // view getCurrentFilePath isn't a .note, so we skip silently.
+        //
+        // ⚠ TRIED AND REVERTED TWICE -- see [[ink2task-sdk-gotchas]] before
+        // attempting a third native-signal fix here:
+        //  (1) 2026-08-11: re-reading getCurrentFilePath() a second time
+        //      ~250ms later. Broke the common case -- legitimate on-page taps
+        //      stopped firing at all.
+        //  (2) 2026-08-13: cross-checking against a timeout-bounded
+        //      getCurrentPageNum(), on the theory it hangs with no active
+        //      editor. Didn't block a confirmed wrong-context tap either --
+        //      it also resolved quickly outside a note.
+        // CONCLUSION: getCurrentFilePath()/getCurrentPageNum() appear to
+        // report "the last note THIS PLUGIN touched", not "what's genuinely
+        // on screen" -- since Ink2Task only ever touches its own note, this
+        // will read as a match almost regardless of true context. No other
+        // signal exists in this SDK (checked PluginManager's full surface,
+        // 2026-08-13: only onStart/onStop lifecycle, nothing screen-scoped).
+        // This is a confirmed, accepted SDK limitation, not something a
+        // cleverer check can fix -- the impact is limited (a sync only ever
+        // writes to the Ink2Task note itself, never whatever's genuinely on
+        // screen; see below), so the check below stays as a best-effort
+        // filter for the common cases (file browser, other notes with no
+        // history) rather than a real guarantee.
         let openPath = '';
         try {
           openPath = (await unwrap(PluginCommAPI.getCurrentFilePath(), 'getCurrentFilePath')) || '';
@@ -137,7 +183,6 @@ PluginManager.registerMotionListener(1, {
         }
         if (!/\.note$/i.test(openPath)) return; // not on a note -- ignore
 
-        const config = await loadConfig();
         // ...and only when that note is OUR checklist. Every note passes the
         // .note test above, so without this a corner tap on any note at all
         // started a sync. syncThenFetch re-checks this itself (requireOpenNote
@@ -158,10 +203,25 @@ PluginManager.registerMotionListener(1, {
         // when the module or permission is missing, so a sync behaves
         // identically with or without a bubble.
         overlayShow('Ink2Task: syncing…');
-        const r = await syncThenFetch(config, {
-          requireOpenNote: true,
-          onPhase: msg => overlayUpdate('Ink2Task: ' + msg),
-        });
+        // Timeout-wrapped: device-reported (2026-08-13) that a hung native
+        // call somewhere inside this chain (this SDK has documented cases of
+        // calls that never resolve OR reject, see sdk.ts's withTimeout doc)
+        // left `busy` stuck true forever, since the `finally` below -- the
+        // ONLY place that resets it -- never ran. Every tap after that one
+        // was silently swallowed by the busy-check with zero visible symptom,
+        // indistinguishable from the tap zone itself being broken; only a
+        // full device reboot (which restarts this JS process) cleared it.
+        // 60s is generous against a real sync's ~5-9s (device-measured) so
+        // this never fires on a legitimately slow one, but guarantees the
+        // button recovers on its own instead of needing a reboot.
+        const r = await withTimeout(
+          syncThenFetch(config, {
+            requireOpenNote: true,
+            onPhase: msg => overlayUpdate('Ink2Task: ' + msg),
+          }),
+          60000,
+          'On-page sync',
+        );
         // The tap landed on a note the plugin doesn't manage (a stray corner
         // stroke on some OTHER note): syncThenFetch did nothing. Stay silent --
         // no dialog, and above all nothing was drawn over the user's page.
@@ -174,7 +234,7 @@ PluginManager.registerMotionListener(1, {
         );
         try {
           NativeUIUtils.showRattaDialog(
-            'Ink2Task\n' + summary,
+            'Ink2Task\n\n' + summary,
             'OK',
             '',
             !(r.warnings && r.warnings.length),
@@ -194,7 +254,7 @@ PluginManager.registerMotionListener(1, {
         // MUST be in finally: if the sync throws partway, an orphaned bubble
         // stays painted over the note with nothing left to remove it.
         overlayHide();
-        busy = false;
+        releaseBusy();
         // Re-arm the debounce from when work *finished*, so a slow (e.g. offline,
         // timing-out) sync can't be immediately re-triggered by another tap.
         lastFire = Date.now();
@@ -258,12 +318,15 @@ PluginManager.registerButtonListener({
     // Shares the on-page SYNC button's busy/debounce state so the two can't run
     // at once.
     const now = Date.now();
-    if (busy || now - lastFire < 2000) return;
-    busy = true;
+    if (now - lastFire < 2000) return;
+    if (!acquireBusy()) return;
     lastFire = now;
     try {
-      const title = await addLassoedTaskToInk2Task();
-      if (!title) {
+      // Timeout-wrapped for the same reason as the on-page SYNC button's
+      // syncThenFetch call above -- this shares the SAME busy/lastFire state,
+      // so a hang here would silently disable SYNC too (and vice versa).
+      const captured = await withTimeout(addLassoedTaskToInk2Task(), 60000, 'Lasso capture');
+      if (!captured) {
         NativeUIUtils.showRattaDialog(
           "Ink2Task: Couldn't read any text from that selection.",
           'OK',
@@ -272,13 +335,18 @@ PluginManager.registerButtonListener({
         );
         return;
       }
+      const {title, target} = captured;
       // Draw it onto the checklist right away. The checklist note isn't the one
       // on screen, so this writes in the background -- reloadIfOpen knows to
       // skip saving/repainting a note that isn't open.
       const config = await loadConfig();
       let summary = `Added:\n"${title}"`;
       try {
-        const r = await syncThenFetch(config);
+        // MUST pass the SAME target the capture just resolved -- see
+        // syncThenFetch's doc. Letting this re-resolve independently
+        // (device-confirmed 2026-08-14) can silently redraw a different page
+        // than the one the task was actually just created on.
+        const r = await withTimeout(syncThenFetch(config, {target}), 60000, 'Lasso redraw');
         summary = formatSyncSummary(
           [title, ...(r.captured || [])],
           r.completedTitles || [],
@@ -288,7 +356,7 @@ PluginManager.registerButtonListener({
       } catch (e) {
         summary += '\n\n⚠ Added, but the checklist redraw failed: ' + (e && e.message ? e.message : 'unknown error');
       }
-      NativeUIUtils.showRattaDialog('Ink2Task\n' + summary, 'OK', '', true);
+      NativeUIUtils.showRattaDialog('Ink2Task\n\n' + summary, 'OK', '', true);
     } catch (err) {
       const raw = err && err.message ? err.message : 'could not add that selection';
       const msg = /network request failed/i.test(raw)
@@ -298,7 +366,7 @@ PluginManager.registerButtonListener({
         NativeUIUtils.showRattaDialog('Ink2Task: ' + capFirst(msg), 'OK', '', false);
       } catch (_) {}
     } finally {
-      busy = false;
+      releaseBusy();
       lastFire = Date.now();
     }
   },

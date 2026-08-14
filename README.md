@@ -1,8 +1,9 @@
 # Ink2Task
 
 A handwritten checklist for Supernote e-ink tablets that syncs with Apple
-Reminders, Google Tasks, or Todoist. Write, check off, and capture tasks with
-a pen, and have them show up as real tasks in whichever app you already use.
+Reminders, Google Tasks, Todoist, or TickTick. Write, check off, and capture
+tasks with a pen, and have them show up as real tasks in whichever app you
+already use.
 
 Inspired by [SuperTask](https://github.com/apclark31/supernote-plugin-research/tree/main/plugins/SuperTask),
 but scoped around one dedicated checklist note instead of a full in-plugin
@@ -42,8 +43,9 @@ https://github.com/user-attachments/assets/458fa3e2-2d6f-4f9a-8660-4f9ea1752949
   reorders the list out from under you.
 - **Follows your app's own order** -- for Google Tasks and Todoist, dragging a
   task to a new spot in the app moves it here too on the next sync. (Apple
-  Reminders has no public API for its manual order, so that one stays in
-  creation-date order instead.)
+  Reminders and TickTick don't expose a reliable manual order through their
+  APIs, so those two stay in creation-date order instead -- a new task,
+  handwritten or lassoed, always lands at the bottom.)
 - **See what a sync is doing** -- tapping the on-page SYNC button shows a small
   floating status bubble ("Reading the page…", "Saving…") so the device doesn't
   just look frozen while it works. It's non-interactive, so you can keep
@@ -73,21 +75,21 @@ Each has its own README with build/setup details:
 Ink2Task talks to a small HTTP server over your network -- pick **one**. They
 share an identical API, so the plugin doesn't know or care which is running.
 
-| | [`mac-server`](mac-server/README.md) | [`google-tasks-server`](google-tasks-server/README.md) | Todoist |
-|---|---|---|---|
-| Task source | Apple Reminders (EventKit) | Google Tasks | Todoist |
-| Runs on | a Mac (only), auto-starts at login | any always-on host -- VPS, Pi, laptop | **nothing to run** -- see below |
-| Setup | `./setup.sh`, one Reminders permission click | Google Cloud OAuth client + one `authorize` run | paste a personal API token into the plugin |
-| Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet |
+| | [`mac-server`](mac-server/README.md) | [`google-tasks-server`](google-tasks-server/README.md) | Todoist | [`ticktick-server`](ticktick-server/README.md) |
+|---|---|---|---|---|
+| Task source | Apple Reminders (EventKit) | Google Tasks | Todoist | TickTick |
+| Runs on | a Mac (only), auto-starts at login | any always-on host -- VPS, Pi, laptop | **nothing to run** -- see below | any always-on host -- VPS, Pi, laptop |
+| Setup | `./setup.sh`, one Reminders permission click | Google Cloud OAuth client + one `authorize` run | paste a personal API token into the plugin | TickTick OAuth client + one `authorize` run |
+| Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet | can be always-on, reachable from anywhere you allow |
 
 **Todoist is a special case: no server needed at all.** Paste a personal API
 token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
 optional standalone service if you'd rather keep the token off the tablet
 entirely, but most people won't need it.
 
-Data model differences worth knowing: Apple Reminders and Todoist both support
-priority and a due **time**, not just a date; Google Tasks has no priority
-concept and due dates are date-only.
+Data model differences worth knowing: Apple Reminders, Todoist, and TickTick
+all support priority and a due **time**, not just a date; Google Tasks has no
+priority concept and due dates are date-only.
 
 ## Install
 
@@ -164,6 +166,41 @@ the checklist it remembers each row's position in a small on-device registry.
 On sync, it reads every pen stroke on the page and checks whether each one's
 center falls inside a known checkbox or a blank writable row. Only what the
 backend confirms completed or created gets erased/redrawn.
+
+## Troubleshooting
+
+- **After installing a new build, the on-page SYNC button doesn't respond at
+  all, even though you removed the old plugin first.** A "remove then
+  install" only replaces the plugin's files on disk -- the Supernote's
+  note-taking app can keep an OLDER copy of the plugin's code running in
+  memory from before the reinstall, so you end up with two versions racing
+  each other in the background (device-confirmed via two duplicate tap
+  listeners firing on every touch). **Reboot the Supernote after installing**
+  -- that fully clears the old copy. Do this any time the on-page button
+  seems dead right after a fresh install, even if you're sure you removed
+  the old one correctly first.
+
+- **The on-page SYNC button stops responding, but "Sync tasks" in the plugin
+  still works.** Fixed as of v1.0.19: a hung native call could previously get
+  the button stuck in a "busy" state forever, with no visible error --
+  reinstalling the plugin didn't help, only a device reboot did. On-page
+  syncs (and lasso capture, which shares the same state) now time out after
+  60 seconds instead of hanging indefinitely, so the button recovers on its
+  own. If you're on an older build and this happens, reboot the Supernote --
+  that clears it. On a current build, if the button still won't respond
+  after 60+ seconds, look for a "timed out" error dialog; that's now the
+  starting point for diagnosing it rather than the timeout being silent.
+
+- **A tap in the SYNC button's corner spot occasionally fires a sync even
+  when you're not on the checklist note** (e.g. on the note picker screen).
+  This is a confirmed Supernote SDK limitation, not an Ink2Task bug: the
+  APIs the plugin uses to check "which note is open" appear to report the
+  last note *this plugin* touched rather than what's genuinely on screen --
+  since Ink2Task only ever touches its own note, that check can't reliably
+  tell the two apart, and there's no other API available to do better. The
+  impact is bounded -- a stray sync only ever writes to the Ink2Task note
+  itself, never whatever you were actually looking at -- so the worst case
+  is an unwanted redraw and a dialog to dismiss, not lost work elsewhere.
 
 ## Limitations
 

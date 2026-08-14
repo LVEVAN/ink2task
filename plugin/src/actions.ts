@@ -14,17 +14,15 @@ import {
   registryKey,
   effectiveConfigForPage,
   bindPage,
-  withLastSyncedPage,
+  withLastViewedPage,
   saveConfig,
   activeProfileOf,
   loadTaskSources,
   saveTaskSources,
   loadErasedInk,
   saveErasedInk,
-  loadSyncedVersion,
-  saveSyncedVersion,
+  saveTicktickSyncMeta,
 } from './utils/config';
-import pluginConfig from '../PluginConfig.json';
 import {
   fetchReminders,
   completeReminders,
@@ -40,11 +38,13 @@ import {
   recycleScan,
 } from './utils/checklistPage';
 import type {MainLayerScan} from './utils/checklistPage';
-import {ensureNote} from './utils/ensureNote';
+import {ensureNote, noteHasBakedInCheckboxes} from './utils/ensureNote';
 import {resolveTarget, reloadIfOpen} from './utils/target';
 import type {Target} from './utils/target';
 import {captureAndCreate} from './utils/capture';
 import {removeBackLink} from './utils/lassoCapture';
+import {runTicktickPreSync, runTicktickPostSync} from './utils/ticktickSync';
+import {taskCallWithAutoRecover} from './utils/autoRecover';
 
 /** Pull the latest reminders and (re)draw the checklist onto its note page. */
 export async function fetchAndWrite(
@@ -56,7 +56,24 @@ export async function fetchAndWrite(
   const key = registryKey(notePath, page);
   const previous = (await loadRegistry())[key] || [];
 
-  const reminders = await fetchReminders(config);
+  // Wrapped in taskCallWithAutoRecover: a connectivity failure (stale host,
+  // e.g. the Mac's LAN IP changed) gets ONE auto-rediscover-and-retry
+  // before throwing -- see autoRecover.ts. Reassigns the local `config` so
+  // anything else in THIS call (TickTick outbox/prune below, the redraw's
+  // header label) uses the corrected address too. Ported from Ink2Day.
+  const fetchResult = await taskCallWithAutoRecover(config, fetchReminders);
+  config = fetchResult.config;
+  const reminders = fetchResult.result;
+  // TickTick only: drop sync-state for anything no longer in this fetch
+  // (completed, deleted, or moved out of the synced project remotely) --
+  // best-effort, mirrors reconcileBackLinks' cleanup below for task-sources.
+  if (activeProfileOf(config).backend === 'ticktick') {
+    try {
+      await runTicktickPostSync(reminders.map(r => r.id));
+    } catch (e: any) {
+      console.log('[Ink2Task] TickTick sync-state prune failed:', e?.message);
+    }
+  }
   const sources = await loadTaskSources();
   const entries = await writeChecklist(notePath, page, reminders, previous, {
     fontPath: config.fontPath,
@@ -69,8 +86,14 @@ export async function fetchAndWrite(
     drawChrome: !isTemplatePage,
     sources,
     // Google Tasks/Todoist have a real manual-order field and already return
-    // reminders sorted by it; Apple Reminders has none, so it stays slot-stable.
-    honorBackendOrder: activeProfileOf(config).backend !== 'apple',
+    // reminders sorted by it. Apple Reminders has none, so it stays
+    // slot-stable. TickTick ALSO stays slot-stable (device-confirmed
+    // 2026-08-14): its API doesn't return a reliable manual order -- newly
+    // created tasks came back first, so a lassoed capture appeared at the TOP
+    // of the list instead of the bottom.
+    honorBackendOrder: ['google', 'todoist'].includes(activeProfileOf(config).backend),
+    use24HourTime: config.use24HourTime,
+    checkboxesBaked: await noteHasBakedInCheckboxes(),
   });
   await saveRegistryEntries(key, entries);
   // Clean up back-links for tasks that are gone, and forget their sources.
@@ -229,10 +252,23 @@ const SKIPPED_RESULT: SyncThenFetch = {
  * other note starts a sync. Lasso capture deliberately leaves it off: it runs
  * from whatever note you lassoed on and needs the checklist redrawn in the
  * background.
+ *
+ * `target`, if given, is used AS-IS instead of a fresh `resolveTarget(config)`
+ * call. Lasso capture's redraw MUST pass the same target `resolveLassoTarget`
+ * already resolved for the capture itself -- re-resolving independently here
+ * (device-confirmed 2026-08-14) can land on a DIFFERENT page than the one just
+ * captured to: resolveTarget's "am I on the checklist note" check relies on
+ * getCurrentFilePath(), which only reports the last note THIS PLUGIN touched
+ * (see resolveLassoTarget's doc) -- and reading the lassoed selection's SOURCE
+ * note in between (to OCR/read it) changes that "last touched" value, so by
+ * the time this second resolve runs it can see a different note than the
+ * capture did and silently fall back to page 0, redrawing the wrong page's
+ * list while the just-created task sits correctly on the backend but never
+ * gets painted onto the page the user is actually looking at.
  */
 export async function syncThenFetch(
   config: Ink2TaskConfig,
-  opts: {requireOpenNote?: boolean; onPhase?: (message: string) => void} = {},
+  opts: {requireOpenNote?: boolean; onPhase?: (message: string) => void; target?: Target} = {},
 ): Promise<SyncThenFetch> {
   // Progress reporting is a CALLBACK, not a UI call, so this module stays free
   // of presentation concerns: index.js drives the floating bubble with it, the
@@ -251,7 +287,7 @@ export async function syncThenFetch(
   // when you're on the Ink2Task note, else falls back to page 0). Resolved
   // ONCE here and threaded into every step below: each resolve is several
   // native round-trips, and the steps all act on the same page anyway.
-  const target = await resolveTarget(config);
+  const target = opts.target ?? (await resolveTarget(config));
   const {notePath, page} = target;
 
   // ⚠️ SAFETY GATE: the on-page listener fires on screen COORDINATES alone, on
@@ -276,14 +312,31 @@ export async function syncThenFetch(
   // elsewhere (Settings, or syncing a different page) in between visits --
   // this is what lets each page recognize and stick to its own backend
   // instead of borrowing whatever's globally active right now. Also record it
-  // as the last-synced page, so a lasso capture made from some OTHER note
-  // defaults here instead of always page 0 -- see resolveLassoTarget.
+  // as the last-VIEWED page (set here, before the sync below even runs --
+  // this is the point we actually confirmed you're on it), so a lasso
+  // capture made from some OTHER note defaults here instead of always page 0
+  // -- see resolveLassoTarget.
+  const boundConfig = withLastViewedPage(
+    bindPage(config, notePath, page, eff.activeProfile, eff.listName),
+    notePath,
+    page,
+  );
   try {
-    await saveConfig(
-      withLastSyncedPage(bindPage(config, notePath, page, eff.activeProfile, eff.listName), notePath, page),
-    );
+    await saveConfig(boundConfig);
   } catch {
     // best-effort; the sync below still uses the right profile either way
+  }
+
+  // TickTick only: retry anything queued while offline BEFORE reading fresh
+  // remote state below -- draining after the fetch could let a just-applied
+  // edit get immediately overwritten by a stale read from the same sync.
+  // Best-effort: draining must never block or fail a sync.
+  if (activeProfileOf(eff).backend === 'ticktick') {
+    try {
+      await runTicktickPreSync(eff);
+    } catch (e: any) {
+      console.log('[Ink2Task] TickTick outbox drain failed:', e?.message);
+    }
   }
 
   // Read the page ONCE and share it: capture (blank + due boxes) and completion
@@ -292,15 +345,11 @@ export async function syncThenFetch(
   phase('Reading the page…');
   const rawScan = await scanMainLayer(notePath, page);
   const inkKey = registryKey(notePath, page);
-  // FIRST SYNC AFTER AN INSTALL: installing makes the host revert our page
-  // edits, so whatever ink is on the page is restored leftovers, not new work.
-  // Wipe it without acting on it -- the redraw below erases it either way, and
-  // ignoring it here is what stops old checkmarks from completing whatever
-  // tasks now sit in those rows. Later syncs use the per-stroke ghost filter.
-  const firstAfterInstall = (await loadSyncedVersion()) !== pluginConfig.versionName;
-  const scan = firstAfterInstall
-    ? {...rawScan, centers: [], strokes: [], texts: []}
-    : dropGhostStrokes(rawScan, (await loadErasedInk())[inkKey] || []);
+  // Installing the plugin can make the host revert page edits, bringing back
+  // ink a PREVIOUS sync already erased -- the per-stroke ghost filter is what
+  // catches that (and everything else already-erased), by fingerprint, on
+  // every sync, not just the first one after an install.
+  const scan = dropGhostStrokes(rawScan, (await loadErasedInk())[inkKey] || []);
   // Capture handwritten tasks AND complete checked ones concurrently. Both only
   // READ (from the shared scan) and hit the backend on independent requests, so
   // running them together shaves a network round-trip off every sync. Both must
@@ -332,9 +381,6 @@ export async function syncThenFetch(
   // reinstall the next sync can tell those strokes from genuinely new ones.
   // Fingerprints the RAW scan: ghosts stay ghosts until real ink replaces them.
   await saveErasedInk(inkKey, inkPrintsOf(rawScan));
-  // Record the version that just synced, so the post-install pass above runs
-  // exactly once per install.
-  if (firstAfterInstall) await saveSyncedVersion(pluginConfig.versionName);
   // If the redraw couldn't erase the handwriting, say so -- otherwise the page
   // looks fine (the checklist covers the ink) until the plugin is removed.
   const redrawWarning = takeRedrawWarning();
@@ -360,5 +406,23 @@ export async function syncThenFetch(
   // detection, the erase checks) is done -- hand them back. Recycling the raw
   // scan covers the ghost-filtered one too; they share the same objects.
   recycleScan(rawScan);
+  // TickTick only: persist what Settings shows as "last sync" -- see the
+  // matching comment in Home.tsx's runFetchAndWrite. Recorded here (the
+  // on-page button path) too, so the status is accurate regardless of which
+  // entry point was used to sync. Unlike Home.tsx, there's no matching
+  // catch-block save for an outright crash -- index.js already shows an
+  // error dialog for that case, and touching it (a global motion listener)
+  // isn't worth the risk for what would only improve a Settings-screen
+  // status line the user wasn't looking at anyway when the crash happened.
+  if (activeProfileOf(eff).backend === 'ticktick') {
+    try {
+      await saveTicktickSyncMeta({
+        lastSyncAt: Date.now(),
+        lastError: warnings.length > 0 ? warnings.join('; ') : undefined,
+      });
+    } catch {
+      // best-effort; the sync itself already succeeded
+    }
+  }
   return {...s, added, captured: cap.created, warnings, duesSet: cap.duesSet};
 }

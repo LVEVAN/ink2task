@@ -1,20 +1,31 @@
 <svg viewBox="0 0 1404 1872" xmlns="http://www.w3.org/2000/svg">
   <rect width="1404" height="1872" fill="#ffffff"/>
 
-  <!-- SYNC button pill; left edge aligned with the left end of the ruled lines (x85) -->
-  <rect x="85" y="100" width="292" height="84" rx="42" fill="#ededed" stroke="#111111" stroke-width="5"/>
+  <!-- SYNC button pill; centered over the full ruled-line span (85..1320),
+       swapped with the platform:list title's old spot (2026-08-13, device
+       request). Was left=85; shifted +471 to center a 292-wide pill in the
+       85..1320 span (center 702.5, half-width 146 -> 556..848). Every piece
+       of the pill (background, logo, label) shifted by the SAME +471 so
+       their relative positions stay identical: only the whole group
+       moved. index.js's on-page tap ZONE must match this exactly, or the
+       button will be visible but untappable, see its own comment. -->
+  <rect x="556" y="100" width="292" height="84" rx="42" fill="#ededed" stroke="#111111" stroke-width="5"/>
 
   <!-- Ink-drop logo inside the pill (drop designed in a 512 box, scaled down) -->
-  <g transform="translate(110,100.6) scale(0.15)">
+  <g transform="translate(581,100.6) scale(0.15)">
     <path d="M256 44 C 150 182 90 252 90 342 a 166 166 0 1 0 332 0 C 422 252 362 182 256 44 Z" fill="#111111"/>
     <path d="M176 350 L232 408 L360 278" fill="none" stroke="#ffffff" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 
   <!-- SYNC label, centered with the drop on the pill's midline -->
-  <text x="185" y="161" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" fill="#111111" letter-spacing="1">SYNC</text>
+  <text x="656" y="161" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="800" fill="#111111" letter-spacing="1">SYNC</text>
 
   <!-- DUE column header, centered over the due column (divider 1164 .. right 1320) -->
-  <text x="1242" y="158" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="46" font-weight="600" fill="#333333" letter-spacing="3">DUE</text>
+  <!-- Baseline y=161, matching SYNC's baseline exactly: was 158 (3px
+       high), device-reported (2026-08-13) as visibly not lined up with SYNC
+       and the platform:list title (drawn dynamically in checklistPage.ts,
+       already calibrated to SYNC's baseline via HEADING_CENTER). -->
+  <text x="1242" y="161" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="46" font-weight="600" fill="#333333" letter-spacing="3">DUE</text>
 
   <!-- Ruled rows: header line + 14 row separators, from left margin to right margin -->
   <g stroke="#c8c8c8" stroke-width="2">
@@ -37,4 +48,31 @@
 
   <!-- Vertical divider between task and DUE columns -->
   <line x1="1164" y1="205" x2="1164" y2="1773" stroke="#c8c8c8" stroke-width="2"/>
+
+  <!-- Checkboxes: one per row, baked into the background so writeChecklist
+       doesn't have to draw them as elements every sync (see checklistPage.ts's
+       BOX_LEFT / BOX_TOP_IN_ROW / BOX_SIZE: these MUST stay in sync with
+       those constants, at listScale=1, or the box outline and the checkmark
+       hit zone drift apart). left=100, size=66x66, top = 205 + 23 + slot*112.
+       stroke-width=2 to match the DUE date boxes' line weight: both the
+       DUE box outline (drawDueBox, via mkRect's default RECT_WIDTH) and the
+       ruled lines/divider above (DIVIDER_WIDTH) use the SAME native pen
+       width (100), which this template's own ruled lines/divider are
+       already calibrated to stroke-width 2, see that g above. -->
+  <g fill="none" stroke="#000000" stroke-width="2">
+    <rect x="100" y="228" width="66" height="66"/>
+    <rect x="100" y="340" width="66" height="66"/>
+    <rect x="100" y="452" width="66" height="66"/>
+    <rect x="100" y="564" width="66" height="66"/>
+    <rect x="100" y="676" width="66" height="66"/>
+    <rect x="100" y="788" width="66" height="66"/>
+    <rect x="100" y="900" width="66" height="66"/>
+    <rect x="100" y="1012" width="66" height="66"/>
+    <rect x="100" y="1124" width="66" height="66"/>
+    <rect x="100" y="1236" width="66" height="66"/>
+    <rect x="100" y="1348" width="66" height="66"/>
+    <rect x="100" y="1460" width="66" height="66"/>
+    <rect x="100" y="1572" width="66" height="66"/>
+    <rect x="100" y="1684" width="66" height="66"/>
+  </g>
 </svg>

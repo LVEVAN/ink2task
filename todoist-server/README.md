@@ -105,6 +105,41 @@ In Ink2Task's on-device settings (open a note → **Ink2Task** icon →
 
 Then Fetch, check items off, and Sync exactly as with the other backends.
 
+## Troubleshooting: server runs fine, but the plugin can't connect
+
+The server printing "Listening on..." only proves it's up -- it doesn't prove
+the Supernote can reach it. If Fetch/Find server keeps failing, work through
+these in order:
+
+1. **Test from another device, not the host itself.** `curl http://<ip>:<port>/health`
+   run *on the machine running the server* will succeed even if nothing else
+   on the network can reach it (it's hitting itself over loopback). Run that
+   same `curl` (or open the URL in a browser) from your phone or laptop while
+   it's on the same Wi-Fi as the Supernote -- that's the real test.
+2. **Make sure the printed IP is actually your LAN address.** A Pi or PC with
+   Docker, Tailscale, a VPN client, WSL, or VirtualBox installed often has
+   several virtual network adapters, and the "first" one the OS reports isn't
+   always the Wi-Fi/Ethernet one. The server lists every address it found at
+   startup -- if the Supernote can't reach the top one, try the others in
+   that list. You can cross-check against the real LAN IP with `ip addr` (Pi
+   / Linux) or `ipconfig` (Windows, look for "Wireless LAN adapter Wi-Fi" or
+   "Ethernet adapter").
+3. **Confirm the Pi/PC and Supernote are on the same network.** Guest Wi-Fi
+   networks and some mesh routers isolate wireless clients from each other
+   (and from wired devices) by default -- if they're on different SSIDs, or
+   your router has "AP/client isolation" or a "guest network" toggle enabled,
+   they'll never see each other regardless of IP/port.
+4. **Check the host's firewall.** Raspberry Pi OS usually has no firewall
+   enabled by default, but if you've turned on `ufw`, allow the port:
+   `sudo ufw allow <port>/tcp`. On Windows, the first time `node`/`npm` binds
+   a port, Windows Defender Firewall normally prompts to allow it on
+   Private/Public networks -- if that prompt was dismissed or blocked, add a
+   rule manually: **Windows Defender Firewall → Advanced settings → Inbound
+   Rules → New Rule → Port → TCP → your port → Allow the connection**.
+5. **Re-check host/port on the plugin side.** Typos are easy with an on-device
+   keyboard -- compare digit-by-digit against what the server printed, or use
+   **Find server on Wi-Fi** instead of typing it.
+
 ## Config file
 
 `~/.ink2task-todoist/config.json`:

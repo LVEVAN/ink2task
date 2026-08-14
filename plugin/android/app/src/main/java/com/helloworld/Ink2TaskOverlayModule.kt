@@ -191,7 +191,14 @@ class Ink2TaskOverlayModule(
 
     // ---------------------------------------------------------------- views --
 
-    /** High-contrast box: e-ink has no color and poor contrast at low weights. */
+    /**
+     * High-contrast box: e-ink has no color and poor contrast at low weights.
+     * Fixed width (see bubbleWidthPx/buildLayoutParams) so swapping the
+     * text between phases ("Reading the page…" -> "Fetching and
+     * redrawing…") doesn't resize or re-center the box -- only the text
+     * inside changes, per device feedback (2026-08-11) that a WRAP_CONTENT
+     * bubble was visibly jumping around as each phase's text changed length.
+     */
     private fun buildBubble(text: String): TextView {
         val density = reactContext.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -200,6 +207,7 @@ class Ink2TaskOverlayModule(
             this.text = text
             setTextColor(Color.BLACK)
             textSize = 16f
+            gravity = Gravity.CENTER
             setPadding(dp(14), dp(10), dp(14), dp(10))
             background = GradientDrawable().apply {
                 setColor(Color.WHITE)
@@ -209,10 +217,17 @@ class Ink2TaskOverlayModule(
         }
     }
 
-    private fun buildLayoutParams(): WindowManager.LayoutParams {
+    /** Fixed bubble width -- comfortably fits the longest phase message
+     * ("Ink2Task: Reading your handwriting…") on one line at textSize 16sp. */
+    private fun bubbleWidthPx(): Int {
         val density = reactContext.resources.displayMetrics.density
+        return (280 * density).toInt()
+    }
+
+    private fun buildLayoutParams(): WindowManager.LayoutParams {
+        val metrics = reactContext.resources.displayMetrics
         return WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            bubbleWidthPx(),
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             // NOT_TOUCHABLE: input passes through to the note underneath.
@@ -222,10 +237,26 @@ class Ink2TaskOverlayModule(
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             android.graphics.PixelFormat.TRANSLUCENT,
         ).apply {
-            // Bottom-centre, clear of the SYNC button (top-left) and of the
-            // checklist rows, so it never covers what the user is reading.
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = (48 * density).toInt()
+            // Top-centre, straddling the FIRST ruled line of the checklist
+            // table (the divider between the SYNC/platform:list/DUE heading
+            // and row 1) so the bubble reads as sync status for the page
+            // without covering either. Moved here from bottom-centre per
+            // device feedback (2026-08-11).
+            //
+            // TUNING HISTORY (2026-08-11): 12% -> too low (overlapping row
+            // 1). 2% -> too high. 7% was an interim guess. Then pixel-
+            // measured directly against a real device screenshot
+            // (icon-drafts/20260811_201221 (1).png, 1404x1872 -- exactly
+            // TPL_W x TPL_H, confirming screen pixels map 1:1 to the
+            // template): the first ruled line (heading/row-1 divider) sits
+            // at y=205, and that 12% screenshot's bubble spanned y=224..282
+            // (58px tall) -- 224 == 0.12*1872 exactly, confirming the
+            // fraction-of-heightPixels model IS accurate and there's no
+            // hidden toolbar offset to account for. Centering a 58px
+            // bubble on y=205 wants its top at 205-29=176px = 176/1872 ≈
+            // 9.4% of screen height.
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = (metrics.heightPixels * 0.094f).toInt()
         }
     }
 }
