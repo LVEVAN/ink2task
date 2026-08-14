@@ -11,7 +11,7 @@ It speaks the **exact same HTTP contract as [`mac-server`](../mac-server/README.
 so the Supernote plugin can't tell which backend it's talking to — you point the
 plugin's Host/Port at this service instead of the Mac, and everything else works
 the same. Unlike `mac-server`, this has no macOS/EventKit dependency, so it runs
-anywhere Node runs: a VPS, a Raspberry Pi, a spare laptop, a home server.
+anywhere Node runs: a VPS, a Mac, a PC, a Raspberry Pi, a spare laptop, a home server.
 
 See the top-level [README's "Choosing a backend"](../README.md#choosing-a-backend)
 for the trade-offs between this and the Mac server.

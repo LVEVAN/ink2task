@@ -78,7 +78,7 @@ share an identical API, so the plugin doesn't know or care which is running.
 | | [`mac-server`](mac-server/README.md) | [`google-tasks-server`](google-tasks-server/README.md) | Todoist | [`ticktick-server`](ticktick-server/README.md) |
 |---|---|---|---|---|
 | Task source | Apple Reminders (EventKit) | Google Tasks | Todoist | TickTick |
-| Runs on | a Mac (only), auto-starts at login | any always-on host -- VPS, Pi, laptop | **nothing to run** -- see below | any always-on host -- VPS, Pi, laptop |
+| Runs on | a Mac (only), auto-starts at login | any always-on host -- VPS, Mac, PC, Pi, laptop | **nothing to run** -- see below | any always-on host -- VPS, Mac, PC, Pi, laptop |
 | Setup | `./setup.sh`, one Reminders permission click | Google Cloud OAuth client + one `authorize` run | paste a personal API token into the plugin | TickTick OAuth client + one `authorize` run |
 | Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet | can be always-on, reachable from anywhere you allow |
 

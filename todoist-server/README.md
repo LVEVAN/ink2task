@@ -12,7 +12,7 @@ and [`google-tasks-server`](../google-tasks-server/README.md)**, so the Supernot
 plugin can't tell which backend it's talking to — point the plugin's Host/Port at
 this service and everything works the same. It has **no runtime dependencies**
 (plain `fetch` against Todoist) and **no macOS dependency**, so it runs anywhere
-Node runs: a VPS, a Raspberry Pi, a spare laptop.
+Node runs: a VPS, a Mac, a PC, a Raspberry Pi, a spare laptop.
 
 **Most people won't need this at all.** The plugin can talk to Todoist
 *directly* from the tablet with just a personal API token pasted into Sync
