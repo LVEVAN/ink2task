@@ -97,6 +97,123 @@ Prints the LAN address to put into Ink2Task's on-device settings: pick
 TickTick as the backend on the Supernote, then enter this host and port
 (default `8955`), same as the other Wi-Fi backends.
 
+Keep the process running while you want the plugin to reach it. `npm start` is
+fine for a quick try, but it stops when you close the terminal — for real use,
+run it always-on with one of the options below.
+
+## Running it always-on
+
+Pick whichever fits your host. Both restart the server on crash and on reboot,
+so you set it up once and forget it.
+
+### Option A — pm2 (simplest, works on macOS / Linux / a Pi -- Windows users see Option C)
+
+```bash
+npm install -g pm2
+cd ticktick-server
+pm2 start npm --name ink2task-ticktick -- start
+pm2 save            # remember it across reboots
+pm2 startup         # prints one command to run (once) so pm2 launches at boot
+```
+
+Useful later: `pm2 logs ink2task-ticktick`, `pm2 restart ink2task-ticktick`,
+`pm2 stop ink2task-ticktick`.
+
+### Option B — systemd (Linux servers and Raspberry Pi)
+
+Create `/etc/systemd/system/ink2task-ticktick.service` (adjust `User`,
+`WorkingDirectory`, and the `npm` path from `which npm`):
+
+```ini
+[Unit]
+Description=Ink2Task TickTick server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Ink2Task/ticktick-server
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ink2task-ticktick
+systemctl status ink2task-ticktick          # check it's running
+journalctl -u ink2task-ticktick -f           # follow its logs
+```
+
+Either way, do the `npm run authorize` step **once as the same user** before
+starting the service, so the access token exists in that user's
+`~/.ink2task-ticktick/config.json`. Since the token is long-lived rather than
+auto-refreshing (see above), plan to rerun `npm run authorize` every few
+months when it nears expiry -- the service will log a clear "run authorize
+again" failure when that happens.
+
+### Option C — Windows
+
+`pm2` itself works fine on Windows, but its `pm2 startup` command (used above)
+only knows how to register with systemd/launchd, not Windows' Task Scheduler --
+use the `pm2-windows-startup` package instead to get the same "survives a
+reboot" behavior:
+
+```powershell
+npm install -g pm2 pm2-windows-startup
+pm2-startup install
+cd ticktick-server
+pm2 start npm --name ink2task-ticktick -- start
+pm2 save
+```
+
+Without that extra step, plain `pm2 start` still restarts the server if it
+crashes, but won't bring it back after a reboot -- you'd need to run
+`pm2 resurrect` (or the two commands above) yourself after restarting the PC.
+Same `npm run authorize` step first, same `pm2 logs` / `pm2 restart` commands
+to manage it afterward.
+
+## Troubleshooting: server runs fine, but the plugin can't connect
+
+The server printing "Listening on..." only proves it's up -- it doesn't prove
+the Supernote can reach it. If Fetch/Find server keeps failing, work through
+these in order:
+
+1. **Test from another device, not the host itself.** `curl http://<ip>:<port>/health`
+   run *on the machine running the server* will succeed even if nothing else
+   on the network can reach it (it's hitting itself over loopback). Run that
+   same `curl` (or open the URL in a browser) from your phone or laptop while
+   it's on the same Wi-Fi as the Supernote -- that's the real test.
+2. **Make sure the printed IP is actually your LAN address.** A Pi or PC with
+   Docker, Tailscale, a VPN client, WSL, or VirtualBox installed often has
+   several virtual network adapters, and the "first" one the OS reports isn't
+   always the Wi-Fi/Ethernet one. The server lists every address it found at
+   startup -- if the Supernote can't reach the top one, try the others in
+   that list. You can cross-check against the real LAN IP with `ip addr` (Pi
+   / Linux) or `ipconfig` (Windows, look for "Wireless LAN adapter Wi-Fi" or
+   "Ethernet adapter").
+3. **Confirm the Pi/PC and Supernote are on the same network.** Guest Wi-Fi
+   networks and some mesh routers isolate wireless clients from each other
+   (and from wired devices) by default -- if they're on different SSIDs, or
+   your router has "AP/client isolation" or a "guest network" toggle enabled,
+   they'll never see each other regardless of IP/port.
+4. **Check the host's firewall.** Raspberry Pi OS usually has no firewall
+   enabled by default, but if you've turned on `ufw`, allow the port:
+   `sudo ufw allow <port>/tcp`. On Windows, the first time `node`/`npm` binds
+   a port, Windows Defender Firewall normally prompts to allow it on
+   Private/Public networks -- if that prompt was dismissed or blocked, add a
+   rule manually: **Windows Defender Firewall → Advanced settings → Inbound
+   Rules → New Rule → Port → TCP → your port → Allow the connection**.
+5. **Re-check host/port on the plugin side.** Typos are easy with an on-device
+   keyboard -- compare digit-by-digit against what the server printed, or use
+   **Find server on Wi-Fi** instead of typing it.
+
 ## Config file
 
 `~/.ink2task-ticktick/config.json` -- **treat this like a password vault**,

@@ -49,6 +49,29 @@ codebase, all verified on our own A5X hardware:
    `SYSTEM_ALERT_WINDOW`. The doc's tap handling, drag→EMR mapping, and
    foreground detection are all unused here.
 
+5. **Gotcha #23 understates `getCurrentFilePath()`/`getCurrentPageNum()`: polling
+   does NOT fix staleness, because the value itself is wrong, not just late.**
+   Confirmed on-device 2026-08-13/14 across three independent fix attempts (a
+   second delayed re-read, a `getCurrentPageNum()` cross-check, and a live
+   incident trace via `adb logcat`) and cross-validated against an unrelated
+   third-party plugin's own bug tracker
+   (`vincentaravantinos/supernote-collapse-expand`), which hit the same gap.
+   These calls report **the last note/page THIS PLUGIN itself touched**, not
+   what's genuinely on screen — there is no "what's currently displayed" signal
+   anywhere in the SDK surface. Two concrete traps this causes: (a) a
+   background listener (motion/button) can fire a write against your own note
+   even when the user is truly elsewhere, if your plugin touched that note
+   recently enough; (b) if your plugin makes ANY native call that reads a
+   *different* note in between two of your own `getCurrentFilePath()` calls
+   (e.g. reading a lasso selection's source note for OCR), a later call in the
+   same handler can report that OTHER note instead of your own — so two
+   resolves seconds apart, in the same function, can disagree. **The fix not
+   the read**: resolve the target ONCE per operation and thread that single
+   result through every step (capture, write, redraw) instead of re-resolving
+   independently at each one — see `syncThenFetch`'s `target` option and its
+   doc comment in `plugin/src/actions.ts` for the pattern that fixed exactly
+   this in our lasso-capture-then-redraw flow.
+
 Our own hard-won findings live in this project's Claude memory
 (`ink2task-sdk-gotchas`). Where that and this skill conflict, **the memory
 wins** — it was measured on this device against this code.

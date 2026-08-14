@@ -204,8 +204,17 @@ backend confirms completed or created gets erased/redrawn.
 
 ## Limitations
 
-- **No offline queue.** A LAN backend has to be reachable (or you need
-  internet, for Todoist) when you sync -- nothing is queued for later.
+- **No offline queue for new tasks.** Creating a task -- handwritten or
+  lassoed -- needs its backend reachable at sync time, for every backend
+  including TickTick; if it isn't, that capture fails outright rather than
+  queuing. (TickTick is the one exception for *edits* to a task that's
+  already synced: completions, un-completions, and handwritten due-date
+  changes queue in an offline outbox and retry on the next successful sync --
+  see `ticktick-server`'s README. The other three backends have no such queue
+  for anything.) A backend server also has to be reachable at all -- on your
+  LAN for `mac-server`/`google-tasks-server`/`ticktick-server`, or just
+  internet for Todoist, which talks to Todoist's cloud directly with no
+  server of its own.
 - **Apple Reminders can't follow manual (drag-to-reorder) order.** There's no
   public EventKit API for it, so that backend stays in creation-date order.
 - **Google Tasks has no priority and no due time**, just a date -- a platform
