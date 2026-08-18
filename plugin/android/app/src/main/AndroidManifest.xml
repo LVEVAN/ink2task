@@ -23,6 +23,24 @@
       AndroidManifest.xml" that names no line.)
     -->
 
+    <!--
+      android:usesCleartextTraffic: every LAN backend (mac-server,
+      google-tasks-server, ticktick-server) speaks plain http://, never
+      https://, and targetSdkVersion 35 blocks cleartext traffic by default
+      (Android 9+/API 28+) unless an app opts in. Device-reported 2026-08-16:
+      TWO users, two different Supernote models (Nomad, Manta), two different
+      backends (Google Tasks, Apple Reminders), reboot and network changes
+      ruled out, and debug logs showed NO request ever reaching the server
+      on ANY port when Sync/Find Server ran from the plugin, which only
+      happens when a request is blocked before it leaves the device. This is
+      the best candidate found so far.
+
+      UNPROVEN, same caveat as the SYSTEM_ALERT_WINDOW note above: this
+      manifest may govern nothing, since the plugin's code runs inside
+      com.ratta.supernote.pluginhost's process rather than as its own
+      installed app. Cheap and harmless to try either way, needs a real
+      device test to confirm.
+    -->
     <application
       android:name=".MainApplication"
       android:label="@string/app_name"
@@ -30,6 +48,7 @@
       android:roundIcon="@mipmap/ic_launcher_round"
       android:allowBackup="false"
       android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="true"
       android:supportsRtl="true">
       <activity
         android:name=".MainActivity"
