@@ -16,7 +16,9 @@ Download the plugin directly here: https://github.com/LVEVAN/ink2task/releases
 
 
 
-https://github.com/user-attachments/assets/458fa3e2-2d6f-4f9a-8660-4f9ea1752949
+
+https://github.com/user-attachments/assets/f8f735c9-a9c2-4331-af06-d9e6e91994d2
+
 
 
 
@@ -83,7 +85,7 @@ share an identical API, so the plugin doesn't know or care which is running.
 | Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet | can be always-on, reachable from anywhere you allow |
 
 **Todoist is a special case: no server needed at all.** Paste a personal API
-token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
+token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac or PC; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
 optional standalone service if you'd rather keep the token off the tablet
 entirely, but most people won't need it.
 
