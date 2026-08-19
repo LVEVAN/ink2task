@@ -92,6 +92,15 @@ export default function Home() {
   // this backend has a persisted status surface; the other three show a
   // transient message that resets when you leave the screen.
   const [ticktickMeta, setTicktickMeta] = useState<TickTickSyncMeta>({});
+  // The Port field's own text, decoupled from config.port (a number).
+  // Device-confirmed 2026-08-19: a naive `value={String(config.port)}` +
+  // `parseInt(v, 10) || config.port` snaps back to the OLD port the instant
+  // the field is cleared (parseInt('') is NaN, falsy, so the fallback wins),
+  // before the next keystroke can land -- making it look like you can only
+  // ever end up with a port starting with the same digit the default did.
+  // This holds whatever's actually typed (including empty, mid-edit) and
+  // only pushes a numeric update to config when it parses to a real port.
+  const [portText, setPortText] = useState('');
 
   // The X button closes this screen even mid-sync -- runFetchAndWrite's promise
   // chain keeps running in the background (so the sync still completes and gets
@@ -108,6 +117,7 @@ export default function Home() {
   useEffect(() => {
     loadConfig().then(c => {
       setConfig(c);
+      setPortText(String(c.port));
       setLoaded(true);
     });
     loadTicktickSyncMeta().then(setTicktickMeta);
@@ -414,6 +424,7 @@ export default function Home() {
       }
       const next = setActiveConnection(config, {host: found.host, port: found.port});
       setConfig(next);
+      setPortText(String(found.port));
       await saveConfig(next);
       setStatus({kind: 'ok', message: `Found the server at ${found.host}:${found.port}. Saved.`});
     } catch (e: any) {
@@ -426,6 +437,7 @@ export default function Home() {
       if (!config) return;
       const next = switchProfile(config, index);
       setConfig(next);
+      setPortText(String(next.port));
       await saveConfig(next);
       setListOptions(null); // lists belong to the previous server
       setListPickerOpen(false);
@@ -660,10 +672,14 @@ export default function Home() {
                   />
                   <Field
                     label="Port"
-                    value={String(config.port)}
-                    onChangeText={v =>
-                      setConfig(setActiveConnection(config, {port: parseInt(v, 10) || config.port}))
-                    }
+                    value={portText}
+                    onChangeText={v => {
+                      setPortText(v);
+                      const n = parseInt(v, 10);
+                      if (Number.isFinite(n) && n > 0) {
+                        setConfig(setActiveConnection(config, {port: n}));
+                      }
+                    }}
                   />
                 </>
               )}
