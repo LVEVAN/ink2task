@@ -23,6 +23,7 @@ import {
   completeTask,
   uncompleteTask,
   createTask,
+  updateTaskDue,
 } from './tasks.js';
 
 type Json = Record<string, unknown>;
@@ -177,7 +178,7 @@ async function main(): Promise<void> {
         return sendJson(res, 200, {reminders});
       }
 
-      // POST /reminders {"title", "list"?} -> {"id", "title"}
+      // POST /reminders {"title", "list"?, "due"?} -> {"id", "title"}
       if (method === 'POST' && path === '/reminders') {
         const body = await readJsonBody(req);
         const title = typeof body.title === 'string' ? body.title.trim() : '';
@@ -185,10 +186,26 @@ async function main(): Promise<void> {
           return sendJson(res, 400, {error: 'Expected JSON body: {"title": "..."}'});
         }
         const listName = typeof body.list === 'string' ? body.list : config.listName;
+        const due = typeof body.due === 'string' ? body.due : undefined;
         const tasks = tasksClient(config);
         const listId = await findListId(tasks, listName);
-        const created = await createTask(tasks, listId, title);
+        const created = await createTask(tasks, listId, title, due);
         return sendJson(res, 200, created);
+      }
+
+      // POST /set-due {"id", "due", "list"?} -> {"ok": true}
+      if (method === 'POST' && path === '/set-due') {
+        const body = await readJsonBody(req);
+        const id = typeof body.id === 'string' ? body.id : '';
+        const due = typeof body.due === 'string' ? body.due : '';
+        if (!id || !due) {
+          return sendJson(res, 400, {error: 'Expected JSON body: {"id": "...", "due": "YYYY-MM-DD"}'});
+        }
+        const listName = typeof body.list === 'string' ? body.list : config.listName;
+        const tasks = tasksClient(config);
+        const listId = await findListId(tasks, listName);
+        await updateTaskDue(tasks, listId, id, due);
+        return sendJson(res, 200, {ok: true});
       }
 
       // POST /complete {"ids": [...]} -> {"completed": [...], "failed": [...]}

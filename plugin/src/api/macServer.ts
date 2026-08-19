@@ -253,7 +253,21 @@ export async function updateReminderDue(
 ): Promise<void> {
   if (isDirectTodoist(config)) return todoistSetDue(token(config), id, due);
   if (activeProfileOf(config).backend === 'ticktick') return pushTicktickDue(config, id, due);
-  throw new Error('Setting a due date is only supported for Todoist and TickTick right now');
+  if (activeProfileOf(config).backend === 'google') {
+    const res = await withTimeout(
+      fetch(`${baseUrl(config)}/set-due`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id, due, list: config.listName}),
+      }),
+      config,
+    );
+    if (!res.ok) {
+      throw new Error(await describeError(res, `${serverLabel(config)} returned ${res.status} while setting due date`));
+    }
+    return;
+  }
+  throw new Error('Setting a due date is not supported for this backend');
 }
 
 /**

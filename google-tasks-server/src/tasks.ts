@@ -137,11 +137,28 @@ export async function createTask(
   tasks: tasks_v1.Tasks,
   listId: string,
   title: string,
+  due?: string,
 ): Promise<{id: string; title: string}> {
+  const requestBody: Record<string, string> = {title};
+  if (due) requestBody.due = new Date(due + 'T00:00:00Z').toISOString();
   const res = await tasks.tasks.insert({
     tasklist: listId,
-    requestBody: {title},
+    requestBody,
   });
   if (!res.data.id) throw new Error('Google Tasks did not return a task id');
   return {id: res.data.id, title: res.data.title ?? title};
+}
+
+/** Sets or clears the due date on an existing task. */
+export async function updateTaskDue(
+  tasks: tasks_v1.Tasks,
+  listId: string,
+  taskId: string,
+  due: string,
+): Promise<void> {
+  await tasks.tasks.patch({
+    tasklist: listId,
+    task: taskId,
+    requestBody: {due: new Date(due + 'T00:00:00Z').toISOString()},
+  });
 }

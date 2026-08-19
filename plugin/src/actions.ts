@@ -142,6 +142,8 @@ export type SyncResult = {
   completedTitles: string[];
   unchecked: number;
   failed: number;
+  /** Set when checkbox detection found nothing despite strokes on the page. */
+  checkboxDiagnostic?: string;
 };
 
 /**
@@ -154,6 +156,7 @@ export function formatSyncSummary(
   completed: string[],
   warnings: string[] = [],
   duesSet: string[] = [],
+  checkboxDiagnostic?: string,
 ): string {
   const lines: string[] = [];
   if (added.length > 0) {
@@ -171,10 +174,10 @@ export function formatSyncSummary(
     for (const d of duesSet) lines.push(d);
   }
   const body = lines.length > 0 ? lines.join('\n') : 'List up to date.';
-  // Warnings last and clearly marked: the handwriting they came from has
-  // already been erased by the redraw, so this is the only notice the user gets.
-  if (warnings.length === 0) return body;
-  return `${body}\n\n⚠ ${warnings.join('\n⚠ ')}`;
+  const parts = [body];
+  if (checkboxDiagnostic) parts.push(checkboxDiagnostic);
+  if (warnings.length > 0) parts.push(`⚠ ${warnings.join('\n⚠ ')}`);
+  return parts.join('\n\n');
 }
 
 /**
@@ -195,7 +198,15 @@ export async function syncCompleted(
   if (entries.length === 0) return {completed: 0, completedTitles: [], unchecked: 0, failed: 0};
 
   const detected = await detectCheckedBoxes(notePath, page, entries, opts.scan);
-  if (detected.length === 0) return {completed: 0, completedTitles: [], unchecked: 0, failed: 0};
+  if (detected.length === 0) {
+    const strokeCount = opts.scan?.centers?.length ?? 0;
+    const syncedCount = entries.filter(e => e.kind === 'synced' && !e.completed).length;
+    let checkboxDiagnostic: string | undefined;
+    if (strokeCount > 0 && syncedCount > 0) {
+      checkboxDiagnostic = `[Debug] ${strokeCount} stroke(s) found on page, ${syncedCount} checkbox(es) checked against, 0 matched. This may indicate a coordinate mismatch on this device.`;
+    }
+    return {completed: 0, completedTitles: [], unchecked: 0, failed: 0, checkboxDiagnostic};
+  }
 
   const res = await completeReminders(config, detected.map(d => d.reminderId));
   const cset = new Set(res.completed);

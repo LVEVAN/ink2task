@@ -1,7 +1,8 @@
 import RNFS from 'react-native-fs';
-import {PluginFileAPI} from 'sn-plugin-lib';
+import {PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {toAbsolute} from './notePicker';
 import {TEMPLATE_PNG_BASE64} from './templateAsset';
+import {TEMPLATE_MANTA_PNG_BASE64} from './templateAssetManta';
 
 /**
  * createNote requires a non-empty template path -- omitting it makes the call
@@ -48,7 +49,7 @@ const NOTE_TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Note.version';
 //   v13 - "DUE" header baseline aligned with SYNC's (was 3px high)
 //   v14 - SYNC button and platform:list title swapped: SYNC now centered
 //         in the top row, title moved to SYNC's old left spot
-const TEMPLATE_VERSION = '14';
+const TEMPLATE_VERSION = '15';
 
 /**
  * The template version at which checkboxes were added to the baked-in
@@ -66,6 +67,16 @@ export const CHECKBOX_BAKE_VERSION = 11;
  * install that only has the .snplg always ends up with the current design (and
  * so redesigns don't require manually deleting the old PNG).
  */
+async function templateBase64ForDevice(): Promise<string> {
+  try {
+    const deviceType = await PluginManager.getDeviceType();
+    if (deviceType === 5) return TEMPLATE_MANTA_PNG_BASE64;
+  } catch {
+    // unknown device, fall back to A5X/Nomad template
+  }
+  return TEMPLATE_PNG_BASE64;
+}
+
 async function ensureTemplate(): Promise<void> {
   const path = toAbsolute(TEMPLATE);
   const versionPath = toAbsolute(TEMPLATE_VERSION_FILE);
@@ -78,7 +89,8 @@ async function ensureTemplate(): Promise<void> {
   if (!(await RNFS.exists(path)) || current !== TEMPLATE_VERSION) {
     const dir = path.slice(0, path.lastIndexOf('/'));
     if (!(await RNFS.exists(dir))) await RNFS.mkdir(dir);
-    await RNFS.writeFile(path, TEMPLATE_PNG_BASE64, 'base64');
+    const base64 = await templateBase64ForDevice();
+    await RNFS.writeFile(path, base64, 'base64');
     try {
       await RNFS.writeFile(versionPath, TEMPLATE_VERSION, 'utf8');
     } catch {
