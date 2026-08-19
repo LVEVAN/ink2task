@@ -77,6 +77,16 @@ export function tasksClient(config: ServerConfig): tasks_v1.Tasks {
 }
 
 /**
+ * Drops the cached client so the next tasksClient() call rebuilds one from
+ * scratch -- needed after server.ts's on-demand reauthorization saves a NEW
+ * refresh token, otherwise the old (now-replaced) token would stay cached
+ * and every call would keep failing with the same invalid_grant.
+ */
+export function resetAuthCache(): void {
+  cachedAuth = null;
+}
+
+/**
  * Forces an access-token mint from the stored refresh token, so the server can
  * fail fast at startup with a clear message if the token is missing or revoked
  * rather than only erroring on the first plugin request.

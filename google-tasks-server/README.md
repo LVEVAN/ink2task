@@ -64,6 +64,24 @@ credentials yourself. Do it once; the values never change afterward.
    - Give it a name and click **Create**.
    - Copy the **Client ID** and **Client secret** from the dialog.
 
+## Opening a terminal
+
+Every command in this README (`npm install`, `npm run authorize`, `npm
+start`, and so on) has to be typed into a terminal, not just found and
+clicked. If that's new to you:
+
+**On a Mac:** Press Cmd+Space, type "Terminal", press Enter. Then type `cd `
+(with a trailing space) and drag the `google-tasks-server` folder from
+Finder into the Terminal window, it fills in the path automatically. Press
+Enter.
+
+**On Windows:** Open File Explorer and navigate into the `google-tasks-server`
+folder. Click into the address bar at the top of the window, type `cmd`, and
+press Enter, that opens a terminal already inside that folder.
+
+Once you're in the right folder with a terminal open, every `npm ...`
+command below runs the same way on both: type it, press Enter.
+
 ## Install & configure
 
 ```bash
@@ -91,7 +109,7 @@ GOOGLE_CLIENT_SECRET=your-client-secret
 Notes:
 - It's a regular visible file (no leading dot). It is **not** the same as
   `credentials.example.env` (the template you copied it from) and **not**
-  `~/.ink2task-google/config.json` (which holds the refresh token, written
+  `~/Ink2Task-Google/config.json` (which holds the refresh token, written
   later by `authorize`).
 - These are the *application's* credentials. They stay in `credentials.env`
   and are never written to the config file. (A dot-prefixed `.env` still works
@@ -107,14 +125,28 @@ npm run authorize
 This opens your browser to Google's consent screen. Sign in with the account
 you added as a test user, and grant access to your tasks. The script runs a
 tiny loopback listener to catch the redirect, exchanges the code for tokens,
-and writes your **refresh token** to `~/.ink2task-google/config.json`.
+and writes your **refresh token** to `~/Ink2Task-Google/config.json`.
 
-You only do this once. The running server refreshes short-lived access tokens
-from that stored refresh token on its own — no browser needed again.
+You only do this once, in the normal case. The running server refreshes
+short-lived access tokens from that stored refresh token on its own — no
+browser needed again.
 
 If your browser doesn't open automatically, the script prints the URL to paste
 in manually. If port 4571 is already in use, set `OAUTH_REDIRECT_PORT` in `credentials.env`
 to a free port and re-run.
+
+**If the plugin ever reports an "invalid_grant" error**, the stored token has
+expired or been revoked, most commonly because the Google Cloud project is
+still in "Testing" mode (the default) and the server hasn't run in about a
+week. As of the server's on-demand reauthorization, you shouldn't need to do
+anything: the next time the Supernote tries to sync and hits this, the
+server running on your computer automatically opens a browser to Google's
+consent screen (or, on a headless machine with no display, prints a link in
+its terminal/log instead) and saves the new token once you sign in, no
+command to remember. Just check the computer running the server and sign in
+when prompted, then try syncing again. If nothing happens within a minute or
+the automatic reconnect fails, running `npm run authorize` manually (see
+"Opening a terminal" above) still works as a fallback.
 
 ## Run the server
 
@@ -187,7 +219,7 @@ journalctl -u ink2task-google -f           # follow its logs
 
 Either way, do the `npm run authorize` step **once as the same user** before
 starting the service, so the refresh token exists in that user's
-`~/.ink2task-google/config.json`.
+`~/Ink2Task-Google/config.json`.
 
 ### Option C — Windows
 
@@ -263,7 +295,7 @@ these in order:
 
 ## Config file
 
-`~/.ink2task-google/config.json` (created by `npm run authorize`):
+`~/Ink2Task-Google/config.json` (created by `npm run authorize`):
 
 ```json
 {

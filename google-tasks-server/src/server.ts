@@ -13,8 +13,9 @@ import './env.js';
 import http from 'node:http';
 import {networkInterfaces} from 'node:os';
 import {URL} from 'node:url';
-import {loadConfig, CONFIG_FILE} from './config.js';
-import {tasksClient, verifyAuth} from './google.js';
+import {loadConfig, saveConfig, CONFIG_FILE} from './config.js';
+import {tasksClient, verifyAuth, resetAuthCache} from './google.js';
+import {runInteractiveAuthorization} from './reauth.js';
 import {
   findListId,
   listTaskListTitles,
@@ -66,18 +67,82 @@ function lanCandidates(): LanCandidate[] {
   return candidates;
 }
 
+/**
+ * True for anything meaning "there's no usable Google token right now" --
+ * either Google's own "this refresh token no longer works" error
+ * (invalid_grant), or our own "there's no token at all yet" guard in
+ * google.ts's tasksClient()/verifyAuth() ("Not authorized yet..."), which
+ * fires the same way for a blank/missing refreshToken. Device-confirmed
+ * 2026-08-19: these are NOT the same error message, and a blank token needs
+ * the exact same auto-reauth response as a revoked one -- both mean "run the
+ * consent flow again," so both should trigger it.
+ */
+function isInvalidGrant(err: unknown): boolean {
+  const msg = (err as Error)?.message || '';
+  return /invalid_grant/i.test(msg) || /not authorized yet/i.test(msg);
+}
+
+// Guards against opening a second browser tab / consent flow while one's
+// already in progress -- e.g. the Supernote retries a sync a few seconds
+// after the first failure, before the user's had a chance to click through
+// Google's consent screen yet.
+let reauthInFlight: Promise<void> | null = null;
+
+/**
+ * Kicks off (or, if one's already running, just lets it keep running)
+ * on-demand reauthorization: opens the browser (or prints a URL, on a
+ * headless machine) the SAME way `npm run authorize` does, and saves the
+ * resulting token once the user completes it. Triggered only by a real
+ * request from the Supernote hitting invalid_grant -- never on a timer --
+ * so nothing happens unless a sync was actually attempted and failed.
+ *
+ * Never throws: this runs detached from the request that triggered it (that
+ * request already got its own error response, see the catch blocks below),
+ * so a failure here just logs and gives up -- the next real sync attempt
+ * will trigger another try.
+ */
+function triggerBackgroundReauth(config: ReturnType<typeof loadConfig>): void {
+  if (reauthInFlight) return;
+  console.log('');
+  console.log('Google Tasks access has expired or was revoked -- reconnecting...');
+  reauthInFlight = runInteractiveAuthorization({announce: m => console.log(m)})
+    .then(refreshToken => {
+      config.refreshToken = refreshToken;
+      saveConfig(config);
+      resetAuthCache();
+      console.log('');
+      console.log('Reconnected. Try syncing from the Supernote again.');
+    })
+    .catch(err => {
+      console.error('Automatic reconnect failed:', err?.message ?? err);
+      console.error('Run `npm run authorize` manually to try again.');
+    })
+    .finally(() => {
+      reauthInFlight = null;
+    });
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
 
   console.log('Ink2Task Google Tasks server starting…');
   try {
     await verifyAuth(config);
+    console.log(`Authorized. Syncing Google Tasks list: "${config.listName}"`);
   } catch (err) {
-    console.error((err as Error).message);
-    console.error('Config file: ' + CONFIG_FILE);
-    process.exit(1);
+    if (isInvalidGrant(err)) {
+      // Don't block startup on this -- start the server anyway and let the
+      // first real Supernote sync attempt trigger reauthorization on demand,
+      // same as any other invalid_grant. Keeps this ONE code path instead of
+      // a separate startup-specific flow.
+      console.log('Google Tasks access has expired or was revoked.');
+      console.log("The server will prompt you to reconnect the first time the Supernote tries to sync.");
+    } else {
+      console.error((err as Error).message);
+      console.error('Config file: ' + CONFIG_FILE);
+      process.exit(1);
+    }
   }
-  console.log(`Authorized. Syncing Google Tasks list: "${config.listName}"`);
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? 'GET';
@@ -154,6 +219,14 @@ async function main(): Promise<void> {
       res.end('Not found');
     } catch (err) {
       console.error(`${method} ${path} failed:`, (err as Error).message);
+      if (isInvalidGrant(err)) {
+        triggerBackgroundReauth(config);
+        return sendJson(res, 401, {
+          error:
+            'Google needs you to reconnect -- check the computer running this server, ' +
+            "a browser tab should have opened. Try syncing again once you've signed in.",
+        });
+      }
       sendJson(res, 500, {error: (err as Error).message});
     }
   });
@@ -198,6 +271,7 @@ async function mutateEach(
     listId = await findListId(tasks, listName);
   } catch (err) {
     console.error('Could not resolve list for batch:', (err as Error).message);
+    if (isInvalidGrant(err)) triggerBackgroundReauth(config);
     return {ok, failed: [...ids]};
   }
   for (const id of ids) {
@@ -206,6 +280,7 @@ async function mutateEach(
       ok.push(id);
     } catch (err) {
       console.error(`Task ${id} failed:`, (err as Error).message);
+      if (isInvalidGrant(err)) triggerBackgroundReauth(config);
       failed.push(id);
     }
   }

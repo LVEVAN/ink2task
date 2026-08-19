@@ -71,17 +71,39 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, what: stri
 }
 
 /**
- * Translates React Native's raw fetch-failure message into something a user
- * can actually act on. `fetch()` throws a bare "Network request failed" for
- * everything from "wrong IP" to "server's not running" to "phone's on the
- * wrong Wi-Fi" -- previously only the on-page SYNC button and lasso capture
- * (index.js) did this translation; the Settings screen showed the raw string
- * verbatim, which is exactly what showed up unexplained in ink2task#2's
- * early reports before we worked out what was actually wrong. Anywhere a
- * caught error's `.message` is shown to the user should go through this.
+ * Translates known raw error messages into something a user can actually act
+ * on. Two sources feed this: React Native's own bare "Network request
+ * failed" (fetch() throws the same string for everything from "wrong IP" to
+ * "server's not running" to "phone's on the wrong Wi-Fi"), and whatever the
+ * backend servers pass through verbatim from their own API client -- e.g.
+ * google-tasks-server used to relay Google's raw OAuth error codes unchanged
+ * (device-confirmed 2026-08-19: a stale token surfaced as the bare string
+ * "invalid_grant", meaningless without context). Previously only the on-page
+ * SYNC button and lasso capture (index.js) translated the network case; the
+ * Settings screen showed raw strings verbatim, which is exactly what showed
+ * up unexplained in ink2task#2's early reports before we worked out what was
+ * actually wrong. Anywhere a caught error's `.message` reaches the user
+ * should go through this.
+ *
+ * The invalid_grant case below is a fallback, not the primary path: a
+ * current google-tasks-server now catches this itself and auto-launches
+ * reauthorization (see its server.ts), returning its OWN already-friendly
+ * "check the computer running this server" message rather than the raw
+ * Google error code -- so this branch should only ever fire against an
+ * older server version, or some other path that still leaks the raw code.
  */
 export function friendlyErrorMessage(raw: string): string {
-  return /network request failed/i.test(raw)
-    ? "Couldn't reach the sync server -- check you're online and on the right Wi-Fi."
-    : raw;
+  if (/network request failed/i.test(raw)) {
+    return "Couldn't reach the sync server -- check you're online and on the right Wi-Fi.";
+  }
+  if (/invalid_grant/i.test(raw)) {
+    return (
+      'Google Tasks needs to be reconnected -- the stored access has expired or was ' +
+      'revoked. A current google-tasks-server does this automatically: check the ' +
+      "computer running it for a browser sign-in prompt, then try again once you've " +
+      'signed in. If nothing happens, run `npm run authorize` there manually as a ' +
+      'fallback.'
+    );
+  }
+  return raw;
 }
