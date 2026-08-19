@@ -95,8 +95,24 @@ async function withTimeout<T>(promise: Promise<T>, config: Ink2TaskConfig): Prom
   ]);
 }
 
+/**
+ * Builds the server URL from host/port. Always assumed plain HTTP over the
+ * LAN, until a real user (GitHub issue #2, 2026-08-19) reported using an
+ * ngrok tunnel to test connectivity: ngrok's public address is HTTPS-only,
+ * so a hardcoded `http://` here silently sent every request to the wrong
+ * protocol on port 443 -- a TLS listener rejecting a plain-HTTP request,
+ * which surfaces to the user as an opaque "can't reach server" with no clue
+ * that the scheme was the problem. If the Host field itself already starts
+ * with "http://" or "https://" (a tunnel/reverse-proxy address, not a bare
+ * LAN IP), that scheme is respected instead of being overridden -- a bare
+ * LAN IP/hostname (the normal case) is untouched and still gets plain HTTP.
+ */
 function baseUrl(config: Ink2TaskConfig): string {
-  return `http://${config.host}:${config.port}`;
+  const host = config.host.trim();
+  if (/^https?:\/\//i.test(host)) {
+    return /:\d+$/.test(host) ? host : `${host}:${config.port}`;
+  }
+  return `http://${host}:${config.port}`;
 }
 
 /**

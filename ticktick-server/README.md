@@ -43,9 +43,16 @@ your LAN, the same as it already does for the other three backends.
 **Device-confirmed (2026-08-11):** TickTick's token response did not include
 a `refresh_token` on a real authorization -- the access token itself is
 simply long-lived (180 days in that run). There's no indication anywhere
-that a shorter-lived token or refresh flow exists; treat `npm run authorize`
-as the renewal step when the token nears expiry, not as a one-time setup you
-should never need again.
+that a shorter-lived token or refresh flow exists.
+
+You don't need to watch the calendar for that, though: this server
+auto-detects an expired or revoked token the moment a real sync from the
+Supernote fails, and relaunches the same browser consent flow on its own
+(a browser tab opens on whichever computer is running the server -- sign in
+there and the next sync picks up the new token automatically). Running
+`npm run authorize` by hand is a fallback for when that can't reach a
+browser (a headless server -- it prints the URL to open elsewhere instead),
+not a routine chore.
 
 ## Prerequisites
 
@@ -82,10 +89,10 @@ npm run authorize
 ```
 
 This opens your browser to TickTick's consent screen. Approve it, and the
-token is saved to `~/.ink2task-ticktick/config.json`. Since TickTick's access
-token is long-lived (see above) rather than refreshable, you generally only
-need to do this once every few months -- if a request ever fails with "run
-authorize again," that's this step.
+token is saved to `ticktick-server/config.json`. Once this is done, the
+running server reconnects automatically if the token ever expires or is
+revoked (see above) -- you shouldn't need to run this again unless the
+server can't open a browser on its own (e.g. a headless machine).
 
 ## 4. Run the server
 
@@ -152,11 +159,11 @@ journalctl -u ink2task-ticktick -f           # follow its logs
 ```
 
 Either way, do the `npm run authorize` step **once as the same user** before
-starting the service, so the access token exists in that user's
-`~/.ink2task-ticktick/config.json`. Since the token is long-lived rather than
-auto-refreshing (see above), plan to rerun `npm run authorize` every few
-months when it nears expiry -- the service will log a clear "run authorize
-again" failure when that happens.
+starting the service, so the access token exists in
+`ticktick-server/config.json`. After that, the service reconnects itself the
+next time a sync hits an expired/revoked token (see above) -- on a headless
+host, watch its logs for the printed consent URL when that happens, since
+there's no desktop for a browser tab to open on.
 
 ### Option C — Windows
 
@@ -216,10 +223,13 @@ these in order:
 
 ## Config file
 
-`~/.ink2task-ticktick/config.json` -- **treat this like a password vault**,
-not like the other backends' config files. Unlike `mac-server`'s or
-`google-tasks-server`'s config, this one holds a live access token, because
-token custody is deliberately kept server-side (see above).
+`ticktick-server/config.json` (gitignored) -- **treat this like a password
+vault**, more so than the other backends' config files: unlike
+`mac-server`'s, this one holds a live access token, because token custody is
+deliberately kept server-side (see above). If you're upgrading from an
+older version of this server, any existing config at
+`~/.ink2task-ticktick/config.json` is moved here automatically the first
+time you run it -- nothing to do by hand.
 
 ```json
 {

@@ -35,6 +35,7 @@ import {
   TickTickTimeoutError,
 } from './ticktick.js';
 import type {RemoteTask} from './ticktick.js';
+import {runInteractiveAuthorization} from './reauth.js';
 
 type Json = Record<string, unknown>;
 
@@ -110,6 +111,7 @@ async function mutateEach(
   listName: string,
   ids: string[],
   op: (cfg: ServerConfig, projectId: string, id: string) => Promise<{config: ServerConfig}>,
+  onAuthError?: () => void,
 ): Promise<{ok: string[]; failed: string[]; config: ServerConfig}> {
   const ok: string[] = [];
   const failed: string[] = [];
@@ -121,6 +123,7 @@ async function mutateEach(
     projectId = resolved.id;
   } catch (err) {
     console.error('Could not resolve project for batch:', (err as Error).name, (err as Error).message);
+    if (err instanceof TickTickAuthError) onAuthError?.();
     return {ok, failed: [...ids], config: cfg};
   }
   for (const id of ids) {
@@ -130,6 +133,7 @@ async function mutateEach(
       ok.push(id);
     } catch (err) {
       console.error(`Task ${id} failed:`, (err as Error).name, (err as Error).message);
+      if (err instanceof TickTickAuthError) onAuthError?.();
       failed.push(id);
     }
   }
@@ -172,6 +176,55 @@ export async function resolveProject(
 
 async function main(): Promise<void> {
   let config: ServerConfig = loadConfig();
+
+  // Guards against opening a second browser tab / consent flow while one's
+  // already in progress -- e.g. the Supernote retries a sync a few seconds
+  // after the first failure, before the user's had a chance to click through
+  // TickTick's consent screen yet. Same pattern as google-tasks-server's
+  // triggerBackgroundReauth.
+  let reauthInFlight: Promise<void> | null = null;
+
+  /**
+   * Kicks off (or, if one's already running, just lets it keep running)
+   * on-demand reauthorization: opens the browser (or prints a URL, on a
+   * headless machine) the SAME way `npm run authorize` does, and saves the
+   * resulting tokens once the user completes it. Triggered only by a real
+   * request from the Supernote hitting TickTickAuthError -- never on a
+   * timer -- so nothing happens unless a sync was actually attempted and
+   * failed.
+   *
+   * Defined here (inside main, closing over the mutable `config` binding)
+   * rather than taking config as a parameter: unlike google-tasks-server's
+   * `const config`, this file reassigns `config` throughout via spreads
+   * (`config = result.config`, etc.), so updating a config OBJECT passed in
+   * at the moment of the error could silently update a copy the request
+   * handler has already moved past. Closing over the binding itself means
+   * every subsequent request sees the refreshed tokens immediately.
+   */
+  function triggerBackgroundReauth(): void {
+    if (reauthInFlight) return;
+    console.log('');
+    console.log('TickTick access has expired or was revoked -- reconnecting...');
+    reauthInFlight = runInteractiveAuthorization({announce: m => console.log(m)})
+      .then(tokens => {
+        config = {
+          ...config,
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken ?? config.refreshToken,
+          accessTokenExpiresAt: tokens.expiresAt,
+        };
+        saveConfig(config);
+        console.log('');
+        console.log('Reconnected. Try syncing from the Supernote again.');
+      })
+      .catch(err => {
+        console.error('Automatic reconnect failed:', err?.message ?? err);
+        console.error('Run `npm run authorize` manually to try again.');
+      })
+      .finally(() => {
+        reauthInFlight = null;
+      });
+  }
 
   console.log('Ink2Task TickTick server starting…');
   // Gated on accessToken, not refreshToken -- TickTick doesn't issue one (see
@@ -339,7 +392,7 @@ async function main(): Promise<void> {
           return sendJson(res, 400, {error: 'Expected JSON body: {"ids": ["..."]}'});
         }
         const wantName = typeof body.list === 'string' ? body.list : (config.projectName ?? '');
-        const result = await mutateEach(config, wantName, ids, completeTask);
+        const result = await mutateEach(config, wantName, ids, completeTask, triggerBackgroundReauth);
         config = result.config;
         return sendJson(res, 200, {completed: result.ok, failed: result.failed});
       }
@@ -369,7 +422,7 @@ async function main(): Promise<void> {
             body: JSON.stringify({id, projectId, status: 0}),
           });
           return {config: after};
-        });
+        }, triggerBackgroundReauth);
         config = result.config;
         return sendJson(res, 200, {uncompleted: result.ok, failed: result.failed});
       }
@@ -390,6 +443,14 @@ async function main(): Promise<void> {
     } catch (err) {
       // Log the error CLASS and message, never request/response bodies.
       console.error(`${method} ${path} failed:`, (err as Error).name, (err as Error).message);
+      if (err instanceof TickTickAuthError) {
+        triggerBackgroundReauth();
+        return sendJson(res, 401, {
+          error:
+            'TickTick needs you to reconnect -- check the computer running this server, ' +
+            "a browser tab should have opened. Try syncing again once you've signed in.",
+        });
+      }
       sendJson(res, statusForError(err), {error: (err as Error).message});
     }
   });

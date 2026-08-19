@@ -1,0 +1,24 @@
+{
+  "name": "ink2task-caldav-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Apple Reminders backend for the Ink2Task Supernote plugin, synced directly via CalDAV -- a drop-in alternative to mac-server that needs no local Mac or EventKit, so it can run on any always-on host (VPS, Cloudflare Workers, Google Cloud Run, a Raspberry Pi).",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup": "tsx src/setup.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.5.0",
+    "ical.js": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
