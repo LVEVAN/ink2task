@@ -20,7 +20,7 @@ import {toAbsolute} from './src/utils/notePicker';
 import {overlayShow, overlayUpdate, overlayHide} from './src/utils/overlay';
 import {syncThenFetch, formatSyncSummary} from './src/actions';
 import {addLassoedTaskToInk2Task} from './src/utils/lassoCapture';
-import {unwrap, withTimeout} from './src/utils/sdk';
+import {unwrap, withTimeout, friendlyErrorMessage} from './src/utils/sdk';
 import {acquireBusy, releaseBusy} from './src/utils/busy';
 
 AppRegistry.registerComponent(appName, () => App);
@@ -242,11 +242,7 @@ PluginManager.registerMotionListener(1, {
         } catch (_) {}
       } catch (err) {
         const raw = err && err.message ? err.message : 'sync failed';
-        // Fetch failures surface as the RN "Network request failed" -- translate
-        // it into something a user can act on rather than the raw string.
-        const msg = /network request failed/i.test(raw)
-          ? "Couldn't reach the sync server -- check you're online and on the right Wi-Fi."
-          : raw;
+        const msg = friendlyErrorMessage(raw);
         try {
           NativeUIUtils.showRattaDialog('Ink2Task: ' + capFirst(msg), 'OK', '', false);
         } catch (_) {}
@@ -359,9 +355,7 @@ PluginManager.registerButtonListener({
       NativeUIUtils.showRattaDialog('Ink2Task\n\n' + summary, 'OK', '', true);
     } catch (err) {
       const raw = err && err.message ? err.message : 'could not add that selection';
-      const msg = /network request failed/i.test(raw)
-        ? "Couldn't reach the sync server -- check you're online and on the right Wi-Fi."
-        : raw;
+      const msg = friendlyErrorMessage(raw);
       try {
         NativeUIUtils.showRattaDialog('Ink2Task: ' + capFirst(msg), 'OK', '', false);
       } catch (_) {}

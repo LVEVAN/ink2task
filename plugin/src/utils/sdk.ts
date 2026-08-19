@@ -69,3 +69,19 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, what: stri
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${what} timed out`)), ms)),
   ]);
 }
+
+/**
+ * Translates React Native's raw fetch-failure message into something a user
+ * can actually act on. `fetch()` throws a bare "Network request failed" for
+ * everything from "wrong IP" to "server's not running" to "phone's on the
+ * wrong Wi-Fi" -- previously only the on-page SYNC button and lasso capture
+ * (index.js) did this translation; the Settings screen showed the raw string
+ * verbatim, which is exactly what showed up unexplained in ink2task#2's
+ * early reports before we worked out what was actually wrong. Anywhere a
+ * caught error's `.message` is shown to the user should go through this.
+ */
+export function friendlyErrorMessage(raw: string): string {
+  return /network request failed/i.test(raw)
+    ? "Couldn't reach the sync server -- check you're online and on the right Wi-Fi."
+    : raw;
+}

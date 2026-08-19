@@ -43,6 +43,7 @@ import {
   fetchLists,
   fetchReminders,
   completeReminders,
+  checkHealth,
 } from '../api/macServer';
 import {displayName, toAbsolute} from '../utils/notePicker';
 import {resolveTarget, reloadIfOpen, openNote} from '../utils/target';
@@ -59,7 +60,7 @@ import {ensureNote, noteHasBakedInCheckboxes} from '../utils/ensureNote';
 import {captureAndCreate} from '../utils/capture';
 import {syncCompleted, formatSyncSummary, reconcileBackLinks} from '../actions';
 import {discoverServer} from '../utils/discover';
-import {unwrap, withTimeout} from '../utils/sdk';
+import {unwrap, withTimeout, friendlyErrorMessage} from '../utils/sdk';
 import pluginConfig from '../../PluginConfig.json';
 
 // A curated set of readable device fonts (from /system/fonts). Not the full
@@ -266,7 +267,7 @@ export default function Home() {
           return {
             created: [] as string[],
             duesSet: [] as string[],
-            warnings: [`Capture failed: ${e?.message || 'unknown error'}`],
+            warnings: [`Capture failed: ${friendlyErrorMessage(e?.message || 'unknown error')}`],
           };
         }),
         syncCompleted(eff, {skipReload: true, scan, target}).catch((e: any) => {
@@ -381,7 +382,7 @@ export default function Home() {
         await openNote(notePath);
       }
     } catch (e: any) {
-      safeSetStatus({kind: 'error', message: e?.message || 'Fetch failed.'});
+      safeSetStatus({kind: 'error', message: friendlyErrorMessage(e?.message || 'Fetch failed.')});
       // Best-effort: `eff` may not exist yet if the crash happened before it
       // was computed, so fall back to the pre-resolution active profile --
       // an approximation, but better than losing the failure entirely for a
@@ -389,7 +390,7 @@ export default function Home() {
       if (activeProfileOf(config).backend === 'ticktick') {
         const meta: TickTickSyncMeta = {
           lastSyncAt: Date.now(),
-          lastError: e?.message || 'Sync failed.',
+          lastError: friendlyErrorMessage(e?.message || 'Sync failed.'),
         };
         safeSetTicktickMeta(meta);
         await saveTicktickSyncMeta(meta);
@@ -416,7 +417,7 @@ export default function Home() {
       await saveConfig(next);
       setStatus({kind: 'ok', message: `Found the server at ${found.host}:${found.port}. Saved.`});
     } catch (e: any) {
-      setStatus({kind: 'error', message: e?.message || 'Search failed.'});
+      setStatus({kind: 'error', message: friendlyErrorMessage(e?.message || 'Search failed.')});
     }
   }, [config]);
 
@@ -445,6 +446,45 @@ export default function Home() {
     [config],
   );
 
+  // Walks through the same steps a sync does (reach the server, confirm the
+  // list exists), reporting each one in plain language instead of a single
+  // opaque failure. Built after a real support thread (ink2task#2) where
+  // "Network request failed" alone took many rounds to actually diagnose --
+  // this surfaces the SAME information a sync would hit, without needing an
+  // open note or risking a real write, so it can be run from Settings alone.
+  const runTestSetup = useCallback(async () => {
+    if (!config) return;
+    setStatus({kind: 'busy', message: 'Testing your setup…'});
+    const lines: string[] = [];
+    const health = await checkHealth(config);
+    if (health.ok) {
+      lines.push(`✓ Reached the server (list on file: "${health.listName}")`);
+    } else {
+      lines.push(`✗ Can't reach the server: ${friendlyErrorMessage(health.error)}`);
+      setStatus({kind: 'error', message: lines.join('\n')});
+      return;
+    }
+    try {
+      const lists = await fetchLists(config);
+      if (lists.length === 0) {
+        lines.push('⚠ Connected, but the server reported no lists at all.');
+      } else if (lists.includes(config.listName)) {
+        lines.push(`✓ List "${config.listName}" found`);
+      } else {
+        lines.push(
+          `⚠ List "${config.listName}" not found. Available: ${lists.join(', ')}`,
+        );
+      }
+      setStatus({
+        kind: lines.some(l => l.startsWith('⚠')) ? 'error' : 'ok',
+        message: lines.join('\n'),
+      });
+    } catch (e: any) {
+      lines.push(`✗ Could not load lists: ${friendlyErrorMessage(e?.message || 'unknown error')}`);
+      setStatus({kind: 'error', message: lines.join('\n')});
+    }
+  }, [config]);
+
   // Step 2: load the lists from the connected server and open the picker.
   const runChooseList = useCallback(async () => {
     if (!config) return;
@@ -466,7 +506,7 @@ export default function Home() {
       setStatus({
         kind: 'error',
         message:
-          (e?.message || 'Could not load lists.') +
+          friendlyErrorMessage(e?.message || 'Could not load lists.') +
           ' Finish Step 1 (connect to the server) first.',
       });
     }
@@ -627,6 +667,15 @@ export default function Home() {
                   />
                 </>
               )}
+
+              <Pressable style={styles.wideButton} onPress={runTestSetup}>
+                <Text style={styles.wideButtonText}>TEST MY SETUP</Text>
+              </Pressable>
+              <Text style={styles.toggleHint}>
+                Checks the server's reachable and the list above exists, and
+                explains what's wrong in plain language if not -- the same
+                checks a real sync does, without writing anything.
+              </Text>
 
               <Text style={styles.stepLabel}>Step 2 · Choose the list to sync the current note page</Text>
               <Pressable style={styles.pickerButton} onPress={runChooseList}>

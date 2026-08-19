@@ -3,7 +3,7 @@
  *
  * Lives in the user's home directory (NOT in the repo, and in its own dir so it
  * never collides with mac-server's ~/.ink2task or the Google backend's
- * ~/.ink2task-google). Holds the Todoist personal API token plus the same
+ * ~/Ink2Task-Google). Holds the Todoist personal API token plus the same
  * list-name / port knobs the other backends have, so the plugin sees an
  * identical service regardless of which backend is running.
  */

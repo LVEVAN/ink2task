@@ -42,6 +42,7 @@ import {ensureNote, noteHasBakedInCheckboxes} from './utils/ensureNote';
 import {resolveTarget, reloadIfOpen} from './utils/target';
 import type {Target} from './utils/target';
 import {captureAndCreate} from './utils/capture';
+import {friendlyErrorMessage} from './utils/sdk';
 import {removeBackLink} from './utils/lassoCapture';
 import {runTicktickPreSync, runTicktickPostSync} from './utils/ticktickSync';
 import {taskCallWithAutoRecover} from './utils/autoRecover';
@@ -362,7 +363,7 @@ export async function syncThenFetch(
       return {
         created: [] as string[],
         duesSet: [] as string[],
-        warnings: [`Capture failed: ${e?.message || 'unknown error'}`],
+        warnings: [`Capture failed: ${friendlyErrorMessage(e?.message || 'unknown error')}`],
       };
     }),
     syncCompleted(eff, {skipReload: true, scan, target}),
