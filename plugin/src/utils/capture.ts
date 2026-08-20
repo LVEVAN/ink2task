@@ -28,6 +28,8 @@ import type {ChecklistEntry, Ink2TaskConfig} from './config';
 
 type Rect = {left: number; top: number; right: number; bottom: number};
 
+const PLUGIN_TEXT = /^(UPDATED:|GOOGLE TASKS|APPLE REMINDERS|TODOIST|TICKTICK|\+\s*\d+\s*MORE)/i;
+
 export type CaptureResult = {
   /** Titles of tasks created from handwriting this pass. */
   created: string[];
@@ -202,7 +204,7 @@ export async function captureBlankRows(
           )) || ''
         ).trim();
       }
-      if (text) results.push({entryIndex: i, text, rect: e.rect});
+      if (text && !PLUGIN_TEXT.test(text)) results.push({entryIndex: i, text, rect: e.rect});
     } catch (err: any) {
       console.log('[Ink2Task] capture box', i, 'failed:', err?.message);
     }

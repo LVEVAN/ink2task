@@ -203,7 +203,14 @@ export async function syncCompleted(
     const syncedCount = entries.filter(e => e.kind === 'synced' && !e.completed).length;
     let checkboxDiagnostic: string | undefined;
     if (strokeCount > 0 && syncedCount > 0) {
-      checkboxDiagnostic = `[Debug] ${strokeCount} stroke(s) found on page, ${syncedCount} checkbox(es) checked against, 0 matched. This may indicate a coordinate mismatch on this device.`;
+      const firstStroke = opts.scan!.centers[0];
+      const firstBox = entries.find(e => e.kind === 'synced' && !e.completed);
+      const ps = opts.scan!.pageSize;
+      let detail = `[Debug] ${strokeCount} stroke(s), ${syncedCount} checkbox(es), 0 matched.`;
+      detail += ` Page ${ps.width}x${ps.height}.`;
+      if (firstStroke) detail += ` Stroke center: (${Math.round(firstStroke.cx)},${Math.round(firstStroke.cy)}).`;
+      if (firstBox) detail += ` Box: (${Math.round(firstBox.box.left)},${Math.round(firstBox.box.top)})-(${Math.round(firstBox.box.right)},${Math.round(firstBox.box.bottom)}).`;
+      checkboxDiagnostic = detail;
     }
     return {completed: 0, completedTitles: [], unchecked: 0, failed: 0, checkboxDiagnostic};
   }
