@@ -132,7 +132,14 @@ export async function uncompleteTask(
   });
 }
 
-/** Creates a task from captured text; returns its id and stored title. */
+/**
+ * Creates a task from captured text; returns its id and stored title.
+ *
+ * Google Tasks inserts at the TOP of the list unless `previous` names the task
+ * to sit after, so we look up the current last task and insert after it. That
+ * keeps the device's row order (oldest at top, new work appended) matching what
+ * Google shows.
+ */
 export async function createTask(
   tasks: tasks_v1.Tasks,
   listId: string,
@@ -143,10 +150,40 @@ export async function createTask(
   if (due) requestBody.due = new Date(due + 'T00:00:00Z').toISOString();
   const res = await tasks.tasks.insert({
     tasklist: listId,
+    previous: await lastTopLevelTaskId(tasks, listId),
     requestBody,
   });
   if (!res.data.id) throw new Error('Google Tasks did not return a task id');
   return {id: res.data.id, title: res.data.title ?? title};
+}
+
+/**
+ * Id of the last top-level task in the list's manual order, or undefined for an
+ * empty list. Completed and hidden tasks count: they still hold a position, so
+ * skipping them would drop the new task above them.
+ */
+async function lastTopLevelTaskId(
+  tasks: tasks_v1.Tasks,
+  listId: string,
+): Promise<string | undefined> {
+  const items: tasks_v1.Schema$Task[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await tasks.tasks.list({
+      tasklist: listId,
+      showCompleted: true,
+      showHidden: true,
+      maxResults: 100,
+      pageToken,
+    });
+    items.push(...(res.data.items ?? []));
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  const topLevel = items
+    .filter(t => t.id && !t.parent)
+    .sort((a, b) => (a.position ?? '').localeCompare(b.position ?? ''));
+  return topLevel[topLevel.length - 1]?.id ?? undefined;
 }
 
 /** Sets or clears the due date on an existing task. */

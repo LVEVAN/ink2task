@@ -231,7 +231,6 @@ PluginManager.registerMotionListener(1, {
           r.completedTitles || [],
           r.warnings || [],
           r.duesSet || [],
-          r.checkboxDiagnostic,
         );
         try {
           NativeUIUtils.showRattaDialog(
@@ -349,7 +348,6 @@ PluginManager.registerButtonListener({
           r.completedTitles || [],
           r.warnings || [],
           r.duesSet || [],
-          r.checkboxDiagnostic,
         );
       } catch (e) {
         summary += '\n\n⚠ Added, but the checklist redraw failed: ' + (e && e.message ? e.message : 'unknown error');

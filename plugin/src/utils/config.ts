@@ -11,6 +11,7 @@
  * unlike a Todoist token it's fine to leave as plain, USB-editable JSON.
  */
 import RNFS from 'react-native-fs';
+import {PluginManager} from 'sn-plugin-lib';
 
 const CONFIG_DIR = '/storage/emulated/0/MyStyle/Ink2Task';
 const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
@@ -127,6 +128,17 @@ export type PageRef = {notePath: string; page: number};
 
 export type PageBinding = {profileIndex: number; listName: string};
 
+const DEFAULT_NOTE_PATH = '/Note/Ink2Task/Ink2Task.note';
+const MANTA_NOTE_PATH = '/Note/Ink2Task/Ink2Task Manta.note';
+
+async function defaultNotePathForDevice(): Promise<string> {
+  try {
+    const dt = await PluginManager.getDeviceType();
+    if (dt === 5) return MANTA_NOTE_PATH;
+  } catch {}
+  return DEFAULT_NOTE_PATH;
+}
+
 const DEFAULT_CONFIG: Ink2TaskConfig = {
   host: '192.168.1.0',
   port: 8942,
@@ -138,7 +150,7 @@ const DEFAULT_CONFIG: Ink2TaskConfig = {
     {label: 'TickTick', backend: 'ticktick', host: '192.168.1.0', port: 8955, listName: 'Inbox'},
   ],
   activeProfile: 0,
-  notePath: '/Note/Ink2Task/Ink2Task.note',
+  notePath: DEFAULT_NOTE_PATH,
   fontPath: '',
   listScale: 1,
 };
@@ -174,25 +186,21 @@ async function migrateLegacy(): Promise<void> {
 export async function loadConfig(): Promise<Ink2TaskConfig> {
   try {
     await migrateLegacy();
+    const devicePath = await defaultNotePathForDevice();
     const exists = await RNFS.exists(CONFIG_FILE);
     if (!exists) {
-      const seeded = {...DEFAULT_CONFIG};
+      const seeded = {...DEFAULT_CONFIG, notePath: devicePath};
       await saveConfig(seeded);
       return seeded;
     }
     const raw = await RNFS.readFile(CONFIG_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     const merged = normalizeProfiles({...DEFAULT_CONFIG, ...parsed});
-    // Repoint an old note path (the SuperRemind note, the earlier Ink2Task
-    // "Reminders.note", or a note a since-removed picker pointed elsewhere) at
-    // the one true Ink2Task.note, so it gets created with the current template
-    // instead of trying to reuse a note that may no longer be appropriate.
-    if (
-      /\/SuperRemind\//.test(merged.notePath) ||
-      /Reminders\.note$/i.test(merged.notePath) ||
-      merged.notePath !== DEFAULT_CONFIG.notePath
-    ) {
-      merged.notePath = DEFAULT_CONFIG.notePath;
+    // Each device gets its own note at native resolution (A5X/Nomad share
+    // 1404x1872; Manta gets 1920x2560) so cloud-synced devices don't fight
+    // over a single page size. Always resolve to the current device's path.
+    if (merged.notePath !== devicePath) {
+      merged.notePath = devicePath;
     }
     return merged;
   } catch (e) {

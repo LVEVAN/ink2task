@@ -289,9 +289,6 @@ export default function Home() {
       let warnings = cap.warnings;
       const duesSet = cap.duesSet;
       const completedTitles = completedResult.completedTitles;
-      const checkboxDiagnostic = 'checkboxDiagnostic' in completedResult
-        ? (completedResult as any).checkboxDiagnostic as string | undefined
-        : undefined;
       safeSetStatus({kind: 'busy', message: 'Fetching the latest list…'});
       // Handwriting/text has been read into reminders; the writeChecklist redraw
       // below wipes all user ink on the page (via replaceElements) in the same op.
@@ -374,7 +371,7 @@ export default function Home() {
       safeSetLastCount(entries.length);
       safeSetStatus({
         kind: warnings.length > 0 ? 'error' : 'ok',
-        message: formatSyncSummary(captured, completedTitles, warnings, duesSet, checkboxDiagnostic),
+        message: formatSyncSummary(captured, completedTitles, warnings, duesSet),
       });
       // TickTick only: persist what Settings shows as "last sync" -- the one
       // persisted status surface this backend has that the other three don't.

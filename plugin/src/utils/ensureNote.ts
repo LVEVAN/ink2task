@@ -49,7 +49,7 @@ const NOTE_TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Note.version';
 //   v13 - "DUE" header baseline aligned with SYNC's (was 3px high)
 //   v14 - SYNC button and platform:list title swapped: SYNC now centered
 //         in the top row, title moved to SYNC's old left spot
-const TEMPLATE_VERSION = '15';
+const TEMPLATE_VERSION = '16';
 
 /**
  * The template version at which checkboxes were added to the baked-in
@@ -69,11 +69,9 @@ export const CHECKBOX_BAKE_VERSION = 11;
  */
 async function templateBase64ForDevice(): Promise<string> {
   try {
-    const deviceType = await PluginManager.getDeviceType();
-    if (deviceType === 5) return TEMPLATE_MANTA_PNG_BASE64;
-  } catch {
-    // unknown device, fall back to A5X/Nomad template
-  }
+    const dt = await PluginManager.getDeviceType();
+    if (dt === 5) return TEMPLATE_MANTA_PNG_BASE64;
+  } catch {}
   return TEMPLATE_PNG_BASE64;
 }
 

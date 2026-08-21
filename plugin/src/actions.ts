@@ -142,8 +142,6 @@ export type SyncResult = {
   completedTitles: string[];
   unchecked: number;
   failed: number;
-  /** Set when checkbox detection found nothing despite strokes on the page. */
-  checkboxDiagnostic?: string;
 };
 
 /**
@@ -156,7 +154,6 @@ export function formatSyncSummary(
   completed: string[],
   warnings: string[] = [],
   duesSet: string[] = [],
-  checkboxDiagnostic?: string,
 ): string {
   const lines: string[] = [];
   if (added.length > 0) {
@@ -174,10 +171,8 @@ export function formatSyncSummary(
     for (const d of duesSet) lines.push(d);
   }
   const body = lines.length > 0 ? lines.join('\n') : 'List up to date.';
-  const parts = [body];
-  if (checkboxDiagnostic) parts.push(checkboxDiagnostic);
-  if (warnings.length > 0) parts.push(`⚠ ${warnings.join('\n⚠ ')}`);
-  return parts.join('\n\n');
+  if (warnings.length === 0) return body;
+  return `${body}\n\n⚠ ${warnings.join('\n⚠ ')}`;
 }
 
 /**
@@ -199,20 +194,7 @@ export async function syncCompleted(
 
   const detected = await detectCheckedBoxes(notePath, page, entries, opts.scan);
   if (detected.length === 0) {
-    const strokeCount = opts.scan?.centers?.length ?? 0;
-    const syncedCount = entries.filter(e => e.kind === 'synced' && !e.completed).length;
-    let checkboxDiagnostic: string | undefined;
-    if (strokeCount > 0 && syncedCount > 0) {
-      const firstStroke = opts.scan!.centers[0];
-      const firstBox = entries.find(e => e.kind === 'synced' && !e.completed);
-      const ps = opts.scan!.pageSize;
-      let detail = `[Debug] ${strokeCount} stroke(s), ${syncedCount} checkbox(es), 0 matched.`;
-      detail += ` Page ${ps.width}x${ps.height}.`;
-      if (firstStroke) detail += ` Stroke center: (${Math.round(firstStroke.cx)},${Math.round(firstStroke.cy)}).`;
-      if (firstBox) detail += ` Box: (${Math.round(firstBox.box.left)},${Math.round(firstBox.box.top)})-(${Math.round(firstBox.box.right)},${Math.round(firstBox.box.bottom)}).`;
-      checkboxDiagnostic = detail;
-    }
-    return {completed: 0, completedTitles: [], unchecked: 0, failed: 0, checkboxDiagnostic};
+    return {completed: 0, completedTitles: [], unchecked: 0, failed: 0};
   }
 
   const res = await completeReminders(config, detected.map(d => d.reminderId));

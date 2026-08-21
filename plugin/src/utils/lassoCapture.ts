@@ -12,7 +12,7 @@
  * page-wiping redraw (replaceElements) is never pointed at a note the plugin
  * doesn't manage -- see the on-page SYNC button's safety gate in actions.ts.
  */
-import {PluginCommAPI, PluginFileAPI, PluginNoteAPI, Element} from 'sn-plugin-lib';
+import {PluginCommAPI, PluginFileAPI, PluginManager, PluginNoteAPI, Element} from 'sn-plugin-lib';
 import {unwrap, recycleElements} from './sdk';
 import {emrToScreen} from './checklistPage';
 import {loadConfig, effectiveConfigForPage, saveTaskSource} from './config';
@@ -255,10 +255,12 @@ async function insertBackLink(
     // rect is EMR too then using it raw puts the link far below the selection --
     // clamped to the page bottom, which is exactly what "too far under" looked
     // like. Detect it: values past the page bounds can only be EMR, so convert.
+    let deviceType = 3;
+    try { deviceType = await PluginManager.getDeviceType(); } catch {}
     let anchor = lassoRect;
     if (anchor && (anchor.bottom > size.height || anchor.right > size.width)) {
-      const tl = emrToScreen({x: anchor.left, y: anchor.top}, size);
-      const br = emrToScreen({x: anchor.right, y: anchor.bottom}, size);
+      const tl = emrToScreen({x: anchor.left, y: anchor.top}, size, deviceType);
+      const br = emrToScreen({x: anchor.right, y: anchor.bottom}, size, deviceType);
       anchor = {
         left: Math.min(tl.x, br.x),
         top: Math.min(tl.y, br.y),

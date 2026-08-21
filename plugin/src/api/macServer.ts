@@ -106,13 +106,24 @@ async function withTimeout<T>(promise: Promise<T>, config: Ink2TaskConfig): Prom
  * with "http://" or "https://" (a tunnel/reverse-proxy address, not a bare
  * LAN IP), that scheme is respected instead of being overridden -- a bare
  * LAN IP/hostname (the normal case) is untouched and still gets plain HTTP.
+ *
+ * The Host field is hand-typed on a device with an awkward keyboard, so it also
+ * tolerates a trailing slash or path, and a port already typed into the Host
+ * (with or without a scheme). Appending config.port on top of one of those
+ * produced a malformed URL like "http://192.168.1.9:3000/:3000", which fetch
+ * rejects before opening a socket -- so nothing ever reached the server and its
+ * log stayed empty, making it look like the plugin wasn't trying at all.
  */
 function baseUrl(config: Ink2TaskConfig): string {
-  const host = config.host.trim();
-  if (/^https?:\/\//i.test(host)) {
-    return /:\d+$/.test(host) ? host : `${host}:${config.port}`;
-  }
-  return `http://${host}:${config.port}`;
+  const raw = config.host.trim().replace(/\/+$/, '');
+  const scheme = /^(https?):\/\//i.exec(raw)?.[1]?.toLowerCase();
+  const rest = scheme ? raw.slice(raw.indexOf('://') + 3) : raw;
+  const authority = rest.split('/')[0];
+  // An https address with no port typed is a tunnel or reverse proxy on 443;
+  // pasting the LAN port onto it would point at a port that isn't listening.
+  const keepBare = /:\d+$/.test(authority) || scheme === 'https';
+  const origin = keepBare ? authority : `${authority}:${config.port}`;
+  return `${scheme ?? 'http'}://${origin}`;
 }
 
 /**
@@ -237,8 +248,8 @@ export async function createReminder(
 
 /**
  * Sets the due date on an existing task to an ISO "YYYY-MM-DD" (from a
- * handwritten DUE cell on an already-synced row). Todoist and TickTick only
- * for now; mac-server and google-tasks-server don't expose this yet, so it
+ * handwritten DUE cell on an already-synced row). Todoist, TickTick and
+ * google-tasks-server support it; mac-server doesn't expose it yet, so it
  * throws there and the caller logs it.
  *
  * The TickTick branch is conflict-aware (see pushTicktickDue in
@@ -263,7 +274,13 @@ export async function updateReminderDue(
       config,
     );
     if (!res.ok) {
-      throw new Error(await describeError(res, `${serverLabel(config)} returned ${res.status} while setting due date`));
+      // A 404 here is the server not knowing /set-due at all, which means it's
+      // running code older than the release that added due-date support.
+      const fallback =
+        res.status === 404
+          ? `${serverLabel(config)} doesn't support due dates yet -- update the server to the latest version and restart it`
+          : `${serverLabel(config)} returned ${res.status} while setting due date`;
+      throw new Error(await describeError(res, fallback));
     }
     return;
   }

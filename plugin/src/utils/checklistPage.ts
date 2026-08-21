@@ -14,7 +14,7 @@
  * PluginFileAPI.getPageSize() so the checklist lands on the template's ruled
  * rows and columns even at other resolutions (the template image scales too).
  */
-import {PluginFileAPI, PluginCommAPI, Element, Geometry, PointUtils} from 'sn-plugin-lib';
+import {PluginFileAPI, PluginCommAPI, PluginManager, Element, Geometry, PointUtils} from 'sn-plugin-lib';
 import type {RemoteReminder} from '../api/macServer';
 import type {ChecklistEntry, TaskSource, TaskSources} from './config';
 import {unwrap, recycleElements} from './sdk';
@@ -958,41 +958,48 @@ type BoundingBox = {left: number; top: number; right: number; bottom: number};
 /**
  * EMR (digitizer) point -> screen point.
  *
- * The SDK's own emrPoint2Android is wrong for portrait notes: it maps the two
- * axes with different scales (maxX for one, maxY for the other), but the
- * digitizer grid is isotropic, and for a portrait page its maxY value is far
- * too small -- so converted X coordinates come out negative and nothing ever
- * matches a checkbox. Verified on an A5X: a single scale of maxX/(width-1)
- * applied to both axes lands strokes exactly on the boxes they were drawn in.
+ * Each Supernote device family has a different digitizer orientation and
+ * scaling relationship. Determined empirically from on-device diagnostic
+ * data (stroke center vs. checkbox bounding box).
  *
- * The transform is still a 90-degree swap: screen X comes from EMR Y (flipped)
- * and screen Y from EMR X, which is why the axes can't share the SDK's
- * mismatched scale in the first place.
+ *   A5X  (dev 3): 90-degree rotation, isotropic scale using maxX.
+ *   Nomad (dev 4): no rotation, separate scales (maxX for x, maxY for y).
+ *   Manta (dev 5): 90-degree rotation, separate scales (maxY for x, maxX for y).
  */
-export function emrToScreen(p: {x: number; y: number}, pageSize: PageSize): {x: number; y: number} {
-  const scale = PointUtils.getRealMaxX(pageSize) / (pageSize.width - 1);
-  return {
-    x: pageSize.width - 1 - p.y / scale,
-    y: p.x / scale,
-  };
+export function emrToScreen(
+  p: {x: number; y: number},
+  pageSize: PageSize,
+  deviceType: number,
+): {x: number; y: number} {
+  const w = pageSize.width - 1;
+  const h = pageSize.height - 1;
+  const maxX = PointUtils.getRealMaxX(pageSize);
+  const maxY = PointUtils.getRealMaxY(pageSize);
+
+  if (deviceType === 4 || deviceType === 5) {
+    // Nomad + Manta: 90-degree rotation, separate scales
+    return {x: w - p.y * w / maxY, y: p.x * h / maxX};
+  }
+  // A5X (default): 90-degree rotation, isotropic scale
+  const scale = maxX / w;
+  return {x: w - p.y / scale, y: p.x / scale};
 }
 
 async function strokeBoundingBox(
   element: any,
   pageSize: PageSize,
+  deviceType: number,
 ): Promise<BoundingBox | null> {
   const points = element?.stroke?.points;
   if (!points) return null;
   const size: number = await points.size();
   if (!size) return null;
-  // One read per stroke: the cost here is per-call round-trip latency, not the
-  // point volume, so a single getRange is faster than any multi-read sampling.
   const pts = await points.getRange(0, size);
   if (!pts || pts.length === 0) return null;
 
   let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
   for (const p of pts) {
-    const s = emrToScreen(p, pageSize);
+    const s = emrToScreen(p, pageSize, deviceType);
     if (s.x < left) left = s.x;
     if (s.x > right) right = s.x;
     if (s.y < top) top = s.y;
@@ -1100,14 +1107,19 @@ export async function detectUncompleted(
   const strokes = (elements || []).filter(
     (el: any) => el.type === 0 && el.layerNum === 0,
   );
+  let deviceType = 3;
+  try { deviceType = await PluginManager.getDeviceType(); } catch {}
+  const bboxes = await Promise.all(
+    strokes.map(s => strokeBoundingBox(s, pageSize, deviceType)),
+  );
 
   const results: DetectedCheck[] = [];
   for (const entry of completedEntries) {
     const checkNums: number[] = [];
-    for (const stroke of strokes) {
-      const bbox = await strokeBoundingBox(stroke, pageSize);
+    for (let i = 0; i < strokes.length; i++) {
+      const bbox = bboxes[i];
       if (bbox && boxesOverlapEnough(bbox, entry.box)) {
-        checkNums.push(stroke.numInPage);
+        checkNums.push(strokes[i].numInPage);
       }
     }
     const strikes = strikeNumsFor(elements, layer, entry);
@@ -1131,30 +1143,6 @@ export async function uncompleteItem(
     PluginFileAPI.deleteElements(notePath, page, detected.strokeNums),
     'deleteElements',
   );
-}
-
-/** Diagnostic: log every page stroke's screen bbox + layer, to compare vs boxes. */
-export async function debugStrokes(notePath: string, page: number): Promise<void> {
-  const size = await unwrap<PageSize>(
-    PluginFileAPI.getPageSize(notePath, page),
-    'getPageSize',
-  );
-  const elements = await unwrap<any[]>(
-    PluginFileAPI.getElements(page, notePath),
-    'getElements',
-  );
-  const all = elements || [];
-  const typeCounts: Record<string, number> = {};
-  for (const el of all) {
-    const k = `type${el?.type}/layer${el?.layerNum}`;
-    typeCounts[k] = (typeCounts[k] || 0) + 1;
-  }
-  console.log('[Ink2Task] DEBUG page elements:', JSON.stringify(typeCounts), 'size', JSON.stringify(size));
-  const strokes = all.filter((el: any) => el.type === 0);
-  for (const s of strokes.slice(0, 12)) {
-    const bbox = await strokeBoundingBox(s, size);
-    console.log('[Ink2Task] DEBUG stroke layer', s.layerNum, 'screenBBox', JSON.stringify(bbox));
-  }
 }
 
 export type StrokeCenter = {stroke: any; cx: number; cy: number};
@@ -1181,11 +1169,16 @@ export async function collectStrokeCenters(
   const strokes = (elements || []).filter(
     (el: any) => el.type === 0 && el.layerNum === 0,
   );
+  let deviceType = 3;
+  try { deviceType = await PluginManager.getDeviceType(); } catch {}
+  const bboxes = await Promise.all(
+    strokes.map(s => strokeBoundingBox(s, size, deviceType)),
+  );
   const out: StrokeCenter[] = [];
-  for (const stroke of strokes) {
-    const bbox = await strokeBoundingBox(stroke, size);
+  for (let i = 0; i < strokes.length; i++) {
+    const bbox = bboxes[i];
     if (!bbox) continue;
-    out.push({stroke, cx: (bbox.left + bbox.right) / 2, cy: (bbox.top + bbox.bottom) / 2});
+    out.push({stroke: strokes[i], cx: (bbox.left + bbox.right) / 2, cy: (bbox.top + bbox.bottom) / 2});
   }
   return out;
 }
@@ -1291,17 +1284,14 @@ export async function scanMainLayer(notePath: string, page: number): Promise<Mai
     PluginFileAPI.getPageSize(notePath, page),
     'getPageSize',
   );
+  let deviceType = 3; // default A5X
+  try { deviceType = await PluginManager.getDeviceType(); } catch {}
   const elements = await unwrap<any[]>(
     PluginFileAPI.getElements(page, notePath),
     'getElements',
   );
-  const centers: StrokeCenter[] = [];
   const strokes: any[] = [];
   const texts: TextElement[] = [];
-  // Everything this scan does NOT keep is dead weight the moment we skip it --
-  // on a drawn checklist page that's most of the page (our own checkboxes,
-  // labels, links, flags). Hand those handles straight back; the ones we retain
-  // are released by recycleScan() once the sync is done with them.
   const dropped: any[] = [];
   for (const el of elements || []) {
     if (el.layerNum !== MAIN_LAYER) {
@@ -1309,12 +1299,7 @@ export async function scanMainLayer(notePath: string, page: number): Promise<Mai
       continue;
     }
     if (el.type === 0) {
-      // TYPE_STROKE
       strokes.push(el);
-      const bbox = await strokeBoundingBox(el, pageSize);
-      if (bbox) {
-        centers.push({stroke: el, cx: (bbox.left + bbox.right) / 2, cy: (bbox.top + bbox.bottom) / 2});
-      }
     } else if (el.type === Element.TYPE_TEXT) {
       const r = el.textBox?.textRect;
       const text = (el.textBox?.textContentFull ?? '').trim();
@@ -1328,6 +1313,16 @@ export async function scanMainLayer(notePath: string, page: number): Promise<Mai
     }
   }
   recycleElements(dropped);
+  const bboxes = await Promise.all(
+    strokes.map(el => strokeBoundingBox(el, pageSize, deviceType)),
+  );
+  const centers: StrokeCenter[] = [];
+  for (let i = 0; i < strokes.length; i++) {
+    const bbox = bboxes[i];
+    if (bbox) {
+      centers.push({stroke: strokes[i], cx: (bbox.left + bbox.right) / 2, cy: (bbox.top + bbox.bottom) / 2});
+    }
+  }
   return {pageSize, centers, strokes, texts};
 }
 
@@ -1406,14 +1401,19 @@ export async function eraseStrokesInZone(
   const strokes = (elements || []).filter(
     (el: any) => el.type === 0 && el.layerNum === 0,
   );
+  let deviceType = 3;
+  try { deviceType = await PluginManager.getDeviceType(); } catch {}
+  const bboxes = await Promise.all(
+    strokes.map(s => strokeBoundingBox(s, size, deviceType)),
+  );
   const nums: number[] = [];
-  for (const stroke of strokes) {
-    const bbox = await strokeBoundingBox(stroke, size);
+  for (let i = 0; i < strokes.length; i++) {
+    const bbox = bboxes[i];
     if (!bbox) continue;
     const cx = (bbox.left + bbox.right) / 2;
     const cy = (bbox.top + bbox.bottom) / 2;
     if (cx >= zone.left && cx <= zone.right && cy >= zone.top && cy <= zone.bottom) {
-      nums.push(stroke.numInPage);
+      nums.push(strokes[i].numInPage);
     }
   }
   if (nums.length > 0) {
@@ -1584,12 +1584,17 @@ export async function clearCompletedItems(
   // ...plus the user's own ink (type 0): the checkmark inside the box, and, for
   // a captured row, the handwriting in the task area. removeDrawnElements alone
   // leaves these behind as orphan strokes.
+  let deviceType = 3;
+  try { deviceType = await PluginManager.getDeviceType(); } catch {}
+  const bboxes = await Promise.all(
+    strokes.map(s => strokeBoundingBox(s, pageSize, deviceType)),
+  );
   for (const entry of done) {
-    for (const stroke of strokes) {
-      const bbox = await strokeBoundingBox(stroke, pageSize);
+    for (let i = 0; i < strokes.length; i++) {
+      const bbox = bboxes[i];
       if (!bbox) continue;
       if (boxesOverlapEnough(bbox, entry.box)) {
-        nums.add(stroke.numInPage);
+        nums.add(strokes[i].numInPage);
         continue;
       }
       if (entry.rect) {
@@ -1597,7 +1602,7 @@ export async function clearCompletedItems(
         const cy = (bbox.top + bbox.bottom) / 2;
         const r = entry.rect;
         if (cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom) {
-          nums.add(stroke.numInPage);
+          nums.add(strokes[i].numInPage);
         }
       }
     }
