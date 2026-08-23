@@ -19,7 +19,6 @@ import {
   loadConfig,
   saveConfig,
   loadRegistry,
-  saveRegistryEntries,
   registryKey,
   setActiveConnection,
   setActiveToken,
@@ -29,7 +28,6 @@ import {
   withLassoTargetOverride,
   activeProfileOf,
   loadTaskSources,
-  loadErasedInk,
   saveErasedInk,
   loadTicktickSyncMeta,
   saveTicktickSyncMeta,
@@ -39,28 +37,26 @@ import {
 } from '../utils/config';
 import {runTicktickPreSync, runTicktickPostSync} from '../utils/ticktickSync';
 import {taskCallWithAutoRecover} from '../utils/autoRecover';
-import {
-  fetchLists,
-  fetchReminders,
-  completeReminders,
-  checkHealth,
-} from '../api/macServer';
+import {fetchLists, fetchReminders} from '../api/macServer';
 import {displayName, toAbsolute} from '../utils/notePicker';
 import {resolveTarget, reloadIfOpen, openNote} from '../utils/target';
 import {
-  writeChecklist,
-  scanMainLayer,
   takeRedrawWarning,
-  dropGhostStrokes,
   inkPrintsOf,
   verifyEraseAndRetry,
   recycleScan,
 } from '../utils/checklistPage';
-import {ensureNote, noteHasBakedInCheckboxes} from '../utils/ensureNote';
-import {captureAndCreate} from '../utils/capture';
-import {syncCompleted, formatSyncSummary, reconcileBackLinks} from '../actions';
+import {ensureNote} from '../utils/ensureNote';
+import {
+  formatSyncSummary,
+  reconcileBackLinks,
+  writePaginated,
+  harvestPages,
+  explainSyncFailure,
+  recoverMissingList,
+} from '../actions';
 import {discoverServer} from '../utils/discover';
-import {unwrap, withTimeout, friendlyErrorMessage} from '../utils/sdk';
+import {unwrap, withTimeout, friendlyErrorMessage, isAuthFailure} from '../utils/sdk';
 import pluginConfig from '../../PluginConfig.json';
 
 // A curated set of readable device fonts (from /system/fonts). Not the full
@@ -84,6 +80,14 @@ export default function Home() {
   // Step 2 list picker: names loaded from the server, and whether it's open.
   const [listOptions, setListOptions] = useState<string[] | null>(null);
   const [listPickerOpen, setListPickerOpen] = useState(false);
+  // Lets the sync retry itself once after a missing list is auto-corrected.
+  // A ref, not a direct call: runFetchAndWrite cannot reference itself inside
+  // its own useCallback. The retry passes isRetry, which is what caps it at ONE
+  // attempt -- a latch stored in a ref would either loop (reset each run) or
+  // block every later recovery in the session (never reset).
+  const runSyncRef = useRef<
+    ((isRetry?: boolean, override?: Ink2TaskConfig) => Promise<void>) | null
+  >(null);
   // Whether the (large) Sync Settings section is expanded.
   const [syncOpen, setSyncOpen] = useState(true);
   // Lasso Capture Target picker: collapsed by default, like the list picker above.
@@ -200,8 +204,13 @@ export default function Home() {
     if (mountedRef.current) setTicktickMeta(m);
   }, []);
 
-  const runFetchAndWrite = useCallback(async () => {
-    if (!config) return;
+  const runFetchAndWrite = useCallback(async (isRetry = false, override?: Ink2TaskConfig) => {
+    // `override` matters: the missing-list retry below hands the CORRECTED
+    // cfg straight back in. Reading it from state would not work -- setConfig
+    // does not take effect until the next render, so the retry would re-run with
+    // the same bad list name and fail identically.
+    const cfg = override ?? config;
+    if (!cfg) return;
     // Per-phase progress text. A sync can take 15-30s+ (mostly the SDK's own
     // element-write latency -- confirmed inherent to it, not something we can
     // optimize away, see [[ink2task-sdk-gotchas]]), and a single static message
@@ -222,7 +231,7 @@ export default function Home() {
       // this is the real backstop -- a UI gate can race, this can't hang.
       // Resolved ONCE and threaded into every step below -- each resolve costs
       // several native round-trips, and they all act on the same page anyway.
-      const target = await withTimeout(resolveTarget(config), 8000, 'resolveTarget');
+      const target = await withTimeout(resolveTarget(cfg), 8000, 'resolveTarget');
       const {notePath, page, isTemplatePage} = target;
       const noteJustCreated = await ensureNote(notePath);
       // Bind this page to the selected profile+list, so its on-page SYNC
@@ -231,7 +240,7 @@ export default function Home() {
       // even runs), so a lasso capture made from some OTHER note defaults
       // here -- see resolveLassoTarget.
       let eff = withLastViewedPage(
-        bindPage(config, notePath, page, config.activeProfile, config.listName),
+        bindPage(cfg, notePath, page, cfg.activeProfile, cfg.listName),
         notePath,
         page,
       );
@@ -247,48 +256,16 @@ export default function Home() {
           console.log('Ink2Task: TickTick outbox drain failed', e?.message);
         }
       }
-      // Read the page ONCE and share it across capture + completion detection,
-      // instead of each re-reading and re-bounding every stroke.
-      const rawScan = await scanMainLayer(notePath, page);
-      const inkKey = registryKey(notePath, page);
-      // Installing the plugin can make the host revert page edits, bringing
-      // back ink a PREVIOUS sync already erased -- the per-stroke ghost
-      // filter is what catches that (and everything else already-erased),
-      // by fingerprint, on every sync, not just the first one after an
-      // install.
-      const scan = dropGhostStrokes(rawScan, (await loadErasedInk())[inkKey] || []);
-      // Whether there was any user ink to erase at all -- gates the two
-      // post-redraw verification reads below (the common repeat-sync has none).
-      const hadInk = (rawScan.strokes?.length ?? 0) > 0;
-      safeSetStatus({kind: 'busy', message: 'Reading your handwriting…'});
-      // Capture handwritten tasks AND complete checked ones CONCURRENTLY --
-      // matching actions.ts's syncThenFetch (the on-page button's path),
-      // which already does this ("shaves a network round-trip off every
-      // sync"). This screen's version ran them one-after-another instead,
-      // a real gap found 2026-08-12 via adb logcat timing on a real sync --
-      // the native element-write phase was already fast/optimized, but this
-      // screen paid for capture's backend round-trip and completion's
-      // separately instead of overlapping them like the on-page path does.
-      // Both only READ (from the shared scan) and hit independent requests,
-      // so nothing about running them together changes what either does.
-      const [cap, completedResult] = await Promise.all([
-        captureAndCreate(eff, scan, target).catch((e: any) => {
-          console.log('Ink2Task: capture failed', e?.message);
-          return {
-            created: [] as string[],
-            duesSet: [] as string[],
-            warnings: [`Capture failed: ${friendlyErrorMessage(e?.message || 'unknown error')}`],
-          };
-        }),
-        syncCompleted(eff, {skipReload: true, scan, target}).catch((e: any) => {
-          console.log('Ink2Task: sync-completed failed', e?.message);
-          return {completedTitles: [] as string[]};
-        }),
-      ]);
-      const captured = cap.created;
-      let warnings = cap.warnings;
-      const duesSet = cap.duesSet;
-      const completedTitles = completedResult.completedTitles;
+      // Read EVERY page holding a checklist, then capture handwriting and
+      // process checkmarks on each, before anything is redrawn. Shared with the
+      // on-page sync path -- see harvestPages on why this cannot be duplicated.
+      const harvest = await harvestPages(eff, notePath, page, target, m =>
+        safeSetStatus({kind: 'busy', message: m}),
+      );
+      const captured = harvest.captured;
+      let warnings = harvest.warnings;
+      const duesSet = harvest.duesSet;
+      const completedTitles = harvest.completedTitles;
       safeSetStatus({kind: 'busy', message: 'Fetching the latest list…'});
       // Handwriting/text has been read into reminders; the writeChecklist redraw
       // below wipes all user ink on the page (via replaceElements) in the same op.
@@ -316,35 +293,31 @@ export default function Home() {
       const previous = (await loadRegistry())[key] || [];
       safeSetStatus({kind: 'busy', message: 'Redrawing the checklist…'});
       const sources = await loadTaskSources();
-      const entries = await writeChecklist(notePath, page, reminders, previous, {
-        fontPath: config.fontPath,
-        scale: config.listScale,
-        header: {platform: activeProfileOf(eff).label, list: eff.listName},
+      // Draws the anchor page plus any continuation pages, via the SAME helper
+      // the on-page sync path uses -- see writePaginated's note on why this is
+      // shared rather than duplicated here.
+      const paged = await writePaginated({
+        config: cfg,
+        notePath,
+        page,
+        isTemplatePage,
+        reminders,
+        previousForAnchor: previous,
         sources,
-        // The template page has the background baked in (ensureNote). Any
-        // other page was added afterward with the device's own note tools (a
-        // second list) and starts blank, so it needs the SYNC/DUE/divider/
-        // lines drawn as elements. isTemplatePage (from resolveTarget) is
-        // more reliable than a raw page-index comparison -- see target.ts.
-        drawChrome: !isTemplatePage,
-        // Google Tasks/Todoist have a real manual-order field and already
-        // return reminders sorted by it. Apple Reminders has none, so it
-        // stays slot-stable. TickTick ALSO stays slot-stable (device-confirmed
-        // 2026-08-14): its API doesn't return a reliable manual order -- newly
-        // created tasks came back first, so a lassoed capture appeared at the
-        // TOP of the list instead of the bottom.
+        header: {platform: activeProfileOf(eff).label, list: eff.listName},
         honorBackendOrder: ['google', 'todoist'].includes(activeProfileOf(eff).backend),
-        use24HourTime: config.use24HourTime,
-        checkboxesBaked: await noteHasBakedInCheckboxes(),
+        inkByPage: harvest.inkByPage,
       });
       // If the redraw couldn't erase the handwriting, say so -- otherwise the
       // page looks fine (the checklist covers the ink) until the plugin is removed.
       const redrawWarning = takeRedrawWarning();
       if (redrawWarning) warnings = [...warnings, redrawWarning];
-      await saveRegistryEntries(key, entries);
+      // Registry entries for every drawn page are saved inside writePaginated.
       // Remember the ink this sync erased, so a reinstall-restored copy of it
       // can be told apart from genuinely new marks next time.
-      await saveErasedInk(inkKey, inkPrintsOf(rawScan));
+      for (const hp of harvest.pages) {
+        await saveErasedInk(registryKey(notePath, hp.page), inkPrintsOf(hp.rawScan));
+      }
       // Clean up back-links for tasks that are gone, and forget their sources.
       await reconcileBackLinks(reminders.map(r => r.id), notePath);
       safeSetStatus({kind: 'busy', message: 'Saving…'});
@@ -352,26 +325,37 @@ export default function Home() {
       // Verify the erase AFTER the save/reload -- saveCurrentNote writes the
       // editor's in-memory buffer, which can put the ink straight back. Only
       // worth the round-trip when there was ink to erase in the first place.
-      if (hadInk) {
-        const {leftover, retried} = await verifyEraseAndRetry(notePath, page);
-        // A retry rewrote the page after the reload, so repaint to show it.
-        if (retried && leftover === 0) await reloadIfOpen(notePath);
+      let repainted = false;
+      for (const hp of harvest.pages) {
+        if (!hp.hadInk) continue;
+        const {leftover, retried} = await verifyEraseAndRetry(notePath, hp.page);
+        if (retried && leftover === 0) repainted = true;
         if (leftover > 0) {
           warnings = [
             ...warnings,
-            `Handwriting not erased -- ${leftover} stroke(s) came back after saving. ` +
-              'The page save appears to be restoring them.',
+            `Handwriting not erased on page ${hp.page + 1} -- ${leftover} stroke(s) came back ` +
+              'after saving. The page save appears to be restoring them.',
           ];
         }
       }
+      // A retry rewrote a page after the reload, so repaint once to show it.
+      if (repainted) await reloadIfOpen(notePath);
       // Everything that needed the scanned page handles (capture/OCR,
       // completion detection, the erase checks) is done -- hand them back.
       // Recycling the raw scan covers the ghost-filtered one too; same objects.
-      recycleScan(rawScan);
-      safeSetLastCount(entries.length);
+      for (const hp of harvest.pages) recycleScan(hp.rawScan);
+      safeSetLastCount(paged.added);
       safeSetStatus({
         kind: warnings.length > 0 ? 'error' : 'ok',
-        message: formatSyncSummary(captured, completedTitles, warnings, duesSet),
+        message: formatSyncSummary(
+          captured,
+          completedTitles,
+          warnings,
+          duesSet,
+          paged.overflow > 0 && paged.pagesNeeded > paged.usablePages
+            ? {hidden: paged.overflow, needed: paged.pagesNeeded}
+            : undefined,
+        ),
       });
       // TickTick only: persist what Settings shows as "last sync" -- the one
       // persisted status surface this backend has that the other three don't.
@@ -392,15 +376,54 @@ export default function Home() {
         await openNote(notePath);
       }
     } catch (e: any) {
-      safeSetStatus({kind: 'error', message: friendlyErrorMessage(e?.message || 'Fetch failed.')});
+      // Explain WHY, not just that it failed. This is what the old "TEST MY
+      // SETUP" button was for; the sync now carries that detail itself, so the
+      // button is gone. Runs only on the failure path.
+      // Log the raw failure BEFORE explaining it. The on-screen message is all
+      // the user sees, and it never reached the log, so a reported error left
+      // nothing to diagnose from (2026-08-23: a Todoist sync failure was
+      // invisible in a full logcat dump).
+      console.log('[Ink2Task] sync failed:', e?.message || String(e), e?.stack || '');
+      // A list that does not exist on this backend is the one failure worth
+      // trying to fix instead of reporting. Switching profiles carries the
+      // stored list name over, and a fresh profile's name is "Inbox", which
+      // TickTick has no equivalent of -- so a first TickTick sync failed before
+      // it had ever worked (device 2026-08-23).
+      if (!isRetry) {
+        const rescue = await recoverMissingList(cfg, e).catch(() => null);
+        if (rescue?.choice) {
+          setConfig(rescue.config);
+          safeSetStatus({kind: 'busy', message: `${rescue.note} Syncing again…`});
+          await runSyncRef.current?.(true, rescue.config);
+          return;
+        }
+        if (rescue && !rescue.choice && rescue.lists.length > 1) {
+          // Several real projects and no obvious winner. Guessing here could
+          // file personal tasks into a work project, so the user picks -- with
+          // the list already loaded, so it is one tap rather than a hunt.
+          setListOptions(rescue.lists);
+          setListPickerOpen(true);
+          safeSetStatus({
+            kind: 'error',
+            message:
+              `This account has no list called "${cfg.listName}". ` +
+              'Tap the one to sync below, then sync again.',
+          });
+          return;
+        }
+      }
+      safeSetStatus({kind: 'busy', message: 'Sync failed, checking why…'});
+      const detail = await explainSyncFailure(cfg, e);
+      console.log('[Ink2Task] sync failure explained as:', detail);
+      safeSetStatus({kind: 'error', message: detail});
       // Best-effort: `eff` may not exist yet if the crash happened before it
       // was computed, so fall back to the pre-resolution active profile --
       // an approximation, but better than losing the failure entirely for a
       // TickTick user.
-      if (activeProfileOf(config).backend === 'ticktick') {
+      if (activeProfileOf(cfg).backend === 'ticktick') {
         const meta: TickTickSyncMeta = {
           lastSyncAt: Date.now(),
-          lastError: friendlyErrorMessage(e?.message || 'Sync failed.'),
+          lastError: friendlyErrorMessage(e?.message || 'Sync failed.', 'TickTick'),
         };
         safeSetTicktickMeta(meta);
         await saveTicktickSyncMeta(meta);
@@ -408,12 +431,14 @@ export default function Home() {
     }
   }, [config]);
 
+  runSyncRef.current = runFetchAndWrite;
+
   const runDiscover = useCallback(async () => {
     if (!config) return;
     const backend = config.profiles[config.activeProfile]?.backend;
     setStatus({kind: 'busy', message: 'Searching this Wi-Fi for the server…'});
     try {
-      const found = await discoverServer(config.port, backend);
+      const found = await discoverServer(config.port, backend, config.host);
       if (!found) {
         setStatus({
           kind: 'error',
@@ -458,44 +483,6 @@ export default function Home() {
     [config],
   );
 
-  // Walks through the same steps a sync does (reach the server, confirm the
-  // list exists), reporting each one in plain language instead of a single
-  // opaque failure. Built after a real support thread (ink2task#2) where
-  // "Network request failed" alone took many rounds to actually diagnose --
-  // this surfaces the SAME information a sync would hit, without needing an
-  // open note or risking a real write, so it can be run from Settings alone.
-  const runTestSetup = useCallback(async () => {
-    if (!config) return;
-    setStatus({kind: 'busy', message: 'Testing your setup…'});
-    const lines: string[] = [];
-    const health = await checkHealth(config);
-    if (health.ok) {
-      lines.push(`✓ Reached the server (list on file: "${health.listName}")`);
-    } else {
-      lines.push(`✗ Can't reach the server: ${friendlyErrorMessage(health.error)}`);
-      setStatus({kind: 'error', message: lines.join('\n')});
-      return;
-    }
-    try {
-      const lists = await fetchLists(config);
-      if (lists.length === 0) {
-        lines.push('⚠ Connected, but the server reported no lists at all.');
-      } else if (lists.includes(config.listName)) {
-        lines.push(`✓ List "${config.listName}" found`);
-      } else {
-        lines.push(
-          `⚠ List "${config.listName}" not found. Available: ${lists.join(', ')}`,
-        );
-      }
-      setStatus({
-        kind: lines.some(l => l.startsWith('⚠')) ? 'error' : 'ok',
-        message: lines.join('\n'),
-      });
-    } catch (e: any) {
-      lines.push(`✗ Could not load lists: ${friendlyErrorMessage(e?.message || 'unknown error')}`);
-      setStatus({kind: 'error', message: lines.join('\n')});
-    }
-  }, [config]);
 
   // Step 2: load the lists from the connected server and open the picker.
   const runChooseList = useCallback(async () => {
@@ -517,9 +504,13 @@ export default function Home() {
     } catch (e: any) {
       setStatus({
         kind: 'error',
-        message:
-          friendlyErrorMessage(e?.message || 'Could not load lists.') +
-          ' Finish Step 1 (connect to the server) first.',
+        // The "finish Step 1" nudge is about connecting, so it is wrong when the
+        // list load failed because the token was rejected -- there is nothing
+        // to connect. See explainSyncFailure for the same trap.
+        message: isAuthFailure(e?.message || '')
+          ? friendlyErrorMessage(e?.message || '', activeProfileOf(config).label)
+          : friendlyErrorMessage(e?.message || 'Could not load lists.') +
+            ' Finish Step 1 (connect to the server) first.',
       });
     }
   }, [config, listPickerOpen]);
@@ -568,7 +559,7 @@ export default function Home() {
         <Pressable
           style={[styles.primaryButton, !canSyncHere && styles.primaryButtonDisabled]}
           disabled={!canSyncHere}
-          onPress={runFetchAndWrite}>
+          onPress={() => runFetchAndWrite()}>
           <Text
             style={[styles.primaryButtonText, !canSyncHere && styles.primaryButtonTextDisabled]}>
             Sync tasks
@@ -576,8 +567,8 @@ export default function Home() {
         </Pressable>
         {!canSyncHere && (
           <Text style={styles.hint}>
-            Open a note first -- syncing isn't available from here. Settings below still work.{'\n'}
-            The first sync creates the checklist note at{' '}
+            Open a note to sync. Settings still work here.{'\n'}
+            The checklist note is created at{' '}
             {config.notePath.slice(0, config.notePath.lastIndexOf('/')) || '/'}.
           </Text>
         )}
@@ -591,7 +582,7 @@ export default function Home() {
 
         {lastCount !== null && (
           <Text style={styles.hint}>
-            Draw a check inside a box, then tap "Sync tasks" to complete it.
+            Draw a check in a box, then Sync.
           </Text>
         )}
 
@@ -604,9 +595,8 @@ export default function Home() {
             <View>
               <Text style={styles.fieldLabel}>Which backend are you using?</Text>
               <Text style={styles.toggleHint}>
-                Tap one to select it. The highlighted button is active — the
-                settings below apply to it, and the on-page SYNC uses it.
-              </Text>
+              The highlighted one is active.
+            </Text>
               <View style={[styles.fontRow, {marginTop: 8, marginBottom: 4}]}>
                 {config.profiles.map((p, i) => {
                   const selected = config.activeProfile === i;
@@ -635,12 +625,8 @@ export default function Home() {
                     onChangeText={v => setConfig(setActiveToken(config, v))}
                   />
                   <Text style={styles.toggleHint}>
-                    Get it in Todoist: Settings → Integrations → Developer. The
-                    plugin talks to Todoist directly — no server to run. This field
-                    can't paste, so for a long token it's easier to set "token" in
-                    MyStyle/Ink2Task/config.json on a computer (see the plugin
-                    README).
-                  </Text>
+              Todoist: Settings, Integrations, Developer. No server needed. Type it slowly, this field can't paste.
+            </Text>
                 </>
               ) : (
                 <>
@@ -654,15 +640,11 @@ export default function Home() {
                     // instructions have served their purpose and just add clutter.
                     (!config.host || config.host === '192.168.1.0') && (
                       <Text style={styles.toggleHint}>
-                        First time? TickTick needs a small helper program running on
-                        your computer to handle the sign-in -- your Supernote can't do
-                        that part itself. Open a terminal in the project's{' '}
-                        ticktick-server folder and run{'\n'}
+                        TickTick needs a helper program on your computer. In the{' '}
+                        ticktick-server folder run{'\n'}
                         `npm run authorize`{'\n'}
-                        to sign in with your TickTick account (see that folder's
-                        README for step-by-step help). Once it's running, tap FIND
-                        SERVER ON WI-FI above, or type its address in below. To switch
-                        accounts later, just run authorize again.
+                        then tap FIND SERVER ON WI-FI above. See that folder's README
+                        for help.
                       </Text>
                     )}
                   <Field
@@ -676,7 +658,18 @@ export default function Home() {
                     onChangeText={v => {
                       setPortText(v);
                       const n = parseInt(v, 10);
-                      if (Number.isFinite(n) && n > 0) {
+                      // Commit only a PLAUSIBLE port, not every keystroke.
+                      // `n > 0` accepted every intermediate value while typing
+                      // or deleting, so backspacing "8942" committed 894, then
+                      // 89, then 8 -- and clearing the field left config.port
+                      // at 8, because the final empty string parses to NaN and
+                      // never overwrote it. Device-confirmed 2026-08-23: the
+                      // Apple profile was left on port 8 and could reach
+                      // nothing. Every backend here uses a high port, and the
+                      // https tunnel case ignores the port entirely (see
+                      // baseUrl), so requiring >= 1024 costs nothing and no
+                      // partial entry can survive.
+                      if (Number.isFinite(n) && n >= 1024 && n <= 65535) {
                         setConfig(setActiveConnection(config, {port: n}));
                       }
                     }}
@@ -684,16 +677,8 @@ export default function Home() {
                 </>
               )}
 
-              <Pressable style={styles.wideButton} onPress={runTestSetup}>
-                <Text style={styles.wideButtonText}>TEST MY SETUP</Text>
-              </Pressable>
-              <Text style={styles.toggleHint}>
-                Checks the server's reachable and the list above exists, and
-                explains what's wrong in plain language if not -- the same
-                checks a real sync does, without writing anything.
-              </Text>
 
-              <Text style={styles.stepLabel}>Step 2 · Choose the list to sync the current note page</Text>
+              <Text style={styles.stepLabel}>Step 2 · Choose the list</Text>
               <Pressable style={styles.pickerButton} onPress={runChooseList}>
                 <Text style={styles.pickerButtonText}>
                   {config.listName ? config.listName : 'No list selected'}
@@ -720,6 +705,64 @@ export default function Home() {
                 </View>
               )}
 
+              <Text style={styles.stepLabel}>Step 4 · Add New Task Behavior</Text>
+              <View style={[styles.fontRow, {marginTop: 4}]}>
+                <Pressable
+                  style={[styles.fontChip, config.newTaskPosition !== 'start' && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, newTaskPosition: 'end'})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.newTaskPosition !== 'start' && styles.fontChipTextOn,
+                    ]}>
+                    At the End
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.fontChip, config.newTaskPosition === 'start' && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, newTaskPosition: 'start'})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.newTaskPosition === 'start' && styles.fontChipTextOn,
+                    ]}>
+                    At the Start
+                  </Text>
+                </Pressable>
+              </View>
+              <Text style={styles.hint}>
+                Not available on Apple Reminders.
+              </Text>
+
+              <Text style={styles.stepLabel}>Step 3 · Long lists</Text>
+              <View style={[styles.fontRow, {marginTop: 4}]}>
+                <Pressable
+                  style={[styles.fontChip, config.autoAddPages !== false && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, autoAddPages: true})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.autoAddPages !== false && styles.fontChipTextOn,
+                    ]}>
+                    Continue on more pages
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.fontChip, config.autoAddPages === false && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, autoAddPages: false})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.autoAddPages === false && styles.fontChipTextOn,
+                    ]}>
+                    One page only
+                  </Text>
+                </Pressable>
+              </View>
+              <Text style={styles.hint}>
+                A long list carries on to pages 2 and 3. Every page keeps its last row free to write in.
+              </Text>
+
               {config.profiles[config.activeProfile]?.backend === 'ticktick' && (
                 <>
                   <Text style={styles.stepLabel}>Status</Text>
@@ -736,12 +779,7 @@ export default function Home() {
 
             <Text style={styles.sectionLabel}>Lasso Capture Target</Text>
             <Text style={styles.toggleHint}>
-              "Add to Ink2Task" (the lasso button on OTHER notes) files the
-              captured text into ONE of your Ink2Task pages. By default:
-              whichever page you synced most recently -- so to switch where
-              captures go, just sync the page you want first, same as any
-              other sync. Pin it below to always use one specific page/list
-              instead, ignoring whatever you synced last.
+              Where lasso captures from other notes land.
             </Text>
             {(() => {
               const boundPages = Object.entries(config.pageBindings || {})
@@ -888,8 +926,7 @@ export default function Home() {
               </Pressable>
             </View>
             <Text style={styles.toggleHint}>
-              Applies to DUE times and LAST UPDATED on the checklist page --
-              takes effect on the next sync.
+              Applies to times drawn on the page.
             </Text>
 
             <Text style={styles.sectionLabel}>On-page SYNC button</Text>
@@ -918,11 +955,7 @@ export default function Home() {
               </Pressable>
             </View>
             <Text style={styles.toggleHint}>
-              The SYNC button drawn on the checklist page itself. Rarely, a
-              tap in that same corner spot while leaving the note (e.g. to
-              the note picker) can trigger a sync -- a known Supernote SDK
-              limitation with no reliable fix. Turn this off to rely only on
-              the "Sync tasks" button above, which has none of that risk.
+              The SYNC button drawn on the page. Turn off if it fires by accident.
             </Text>
 
             <Text style={styles.versionText}>

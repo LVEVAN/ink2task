@@ -13,7 +13,7 @@
  */
 import {discoverServer} from './discover';
 import {isNetworkError} from './ticktickSync';
-import {replaceStaleServerAddress, saveConfig} from './config';
+import {replaceStaleServerAddress, saveConfig, isDirectTodoist} from './config';
 import type {Ink2TaskConfig} from './config';
 
 /**
@@ -38,12 +38,29 @@ export async function taskCallWithAutoRecover<T>(
   config: Ink2TaskConfig,
   call: (config: Ink2TaskConfig) => Promise<T>,
 ): Promise<{result: T; config: Ink2TaskConfig}> {
+  // NO HOST SET AT ALL (a fresh install): discovery is the only sensible first
+  // move. Firing a request at an empty address just wastes a timeout and, worse,
+  // the failure it produces is not always shaped like a network error, so the
+  // catch below would rethrow without ever searching. Direct-Todoist has no
+  // server to find, so it is excluded.
+  if (!config.host.trim() && !isDirectTodoist(config)) {
+    const backend = config.profiles[config.activeProfile]?.backend;
+    const found = await discoverServer(config.port, backend, config.host).catch(() => null);
+    if (found) {
+      const patched = {...config, host: found.host, port: found.port};
+      const result = await call(patched);
+      const fixed = replaceStaleServerAddress(config, config.host, config.port, found.host, found.port);
+      await saveConfig(fixed).catch(() => {});
+      return {result, config: fixed};
+    }
+    // Nothing found; fall through so the real call produces the real error.
+  }
   try {
     return {result: await call(config), config};
   } catch (e) {
     if (!isNetworkError(e)) throw e;
     const backend = config.profiles[config.activeProfile]?.backend;
-    const found = await discoverServer(config.port, backend).catch(() => null);
+    const found = await discoverServer(config.port, backend, config.host).catch(() => null);
     if (!found || (found.host === config.host && found.port === config.port)) throw e;
     const patched = {...config, host: found.host, port: found.port};
     const result = await call(patched); // one retry only -- let a second failure throw uncaught
@@ -51,4 +68,34 @@ export async function taskCallWithAutoRecover<T>(
     await saveConfig(fixed).catch(() => {});
     return {result, config: fixed};
   }
+}
+
+/**
+ * checkHealth with the same auto-discovery the task calls get.
+ *
+ * Kept separate from taskCallWithAutoRecover because checkHealth reports failure
+ * as a RETURN VALUE (`{ok: false, error}`) rather than by throwing, so the
+ * try/catch there would never fire. Without this, the one call whose whole job
+ * is diagnosing connectivity was the only one that could not fix it -- which is
+ * exactly what left a fresh install saying "can't reach the server" while the
+ * server sat discoverable on the same Wi-Fi (2026-08-23).
+ */
+export async function checkHealthWithAutoRecover(
+  config: Ink2TaskConfig,
+  check: (config: Ink2TaskConfig) => Promise<{ok: boolean}>,
+): Promise<{result: any; config: Ink2TaskConfig}> {
+  const first = await check(config);
+  if (first.ok || isDirectTodoist(config)) return {result: first, config};
+
+  const backend = config.profiles[config.activeProfile]?.backend;
+  const found = await discoverServer(config.port, backend, config.host).catch(() => null);
+  if (!found || (found.host === config.host && found.port === config.port)) {
+    return {result: first, config};
+  }
+  const patched = {...config, host: found.host, port: found.port};
+  const retry = await check(patched);
+  if (!retry.ok) return {result: first, config}; // report the ORIGINAL failure
+  const fixed = replaceStaleServerAddress(config, config.host, config.port, found.host, found.port);
+  await saveConfig(fixed).catch(() => {});
+  return {result: retry, config: fixed};
 }

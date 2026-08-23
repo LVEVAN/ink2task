@@ -91,6 +91,7 @@ function toWireReminder(t: RemoteTask): Json {
     ...(t.due ? {due: t.due} : {}),
     ...(t.priority ? {priority: t.priority} : {}),
     ...(t.etag ? {etag: t.etag} : {}),
+    ...(t.parentId ? {parentId: t.parentId} : {}),
   };
 }
 
@@ -262,6 +263,9 @@ async function main(): Promise<void> {
           backend: 'ticktick',
           connected: !!config.accessToken,
           listName: config.projectName ?? null,
+          // See the note on this key in todoist-server. TickTick's `parentId`
+          // is undocumented but live-verified (see TickTickTaskRaw.parentId).
+          features: ['subtasks'],
         });
       }
 
@@ -328,6 +332,8 @@ async function main(): Promise<void> {
           notes: typeof body.notes === 'string' ? body.notes : undefined,
           due: typeof body.due === 'string' ? body.due : undefined,
           priority: isPriorityTier(body.priority) ? body.priority : undefined,
+          parentId: typeof body.parentId === 'string' ? body.parentId : undefined,
+          atStart: body.position === 'start',
         });
         config = afterCreate;
         return sendJson(res, 200, {id: task.id, title: task.title});

@@ -11,9 +11,30 @@
  * discovery just returns null and the user falls back to typing the IP.
  */
 import RNFS from 'react-native-fs';
+import {NativeModules} from 'react-native';
+import {lanFetch} from './lanHttp';
 
-const HEALTH_TIMEOUT_MS = 700; // per-host probe; hosts that aren't there hang until this
-const CONCURRENCY = 24; // parallel probes; ~254/24 * 0.7s ≈ 7s worst case per subnet
+// Per-host probe timeout, and how many hosts are probed at once.
+//
+// Was 700ms / 24. Each host probes every known port IN PARALLEL, so 24 hosts
+// meant up to 96 simultaneous fetches on an e-ink device -- enough load that a
+// probe to a HEALTHY server could exceed 700ms and be aborted, making discovery
+// miss a server that was sitting right there. A false negative is much worse
+// than a slow sweep, since it sends the user off to type an IP by hand.
+//
+// 1500ms is slower per host in the worst case but far steadier, and in practice
+// the server answers in the first few hundred ms.
+//
+// Concurrency went 8 -> 32 when the probe moved onto lanHttp's native socket
+// (2026-08-23). Before that, cleartext HTTP was blocked for this process, so
+// every probe failed in microseconds and the sweep's wall time was fiction --
+// 1016 probes finished in 2.8s without a single packet leaving the device. Now
+// that the probes are real, a dead address costs the FULL timeout, so 8 at a
+// time meant 254/8 * 1.5s ≈ 48s of staring at a button. A native probe is a
+// bare socket on its own thread, not an HTTP stack, so 32 hosts x 4 ports is
+// affordable where 24 fetches was not: 254/32 * 1.5s ≈ 12s worst case.
+const HEALTH_TIMEOUT_MS = 1500;
+const CONCURRENCY = 32;
 
 /** Little-endian 8-hex-digit address (as /proc/net/route stores them) -> dotted IP. */
 function hexLEtoIp(hex: string): string | null {
@@ -27,6 +48,65 @@ function hexLEtoIp(hex: string): string | null {
 /** First three octets of an IP, i.e. its /24 base ("192.168.5.1" -> "192.168.5"). */
 function base24(ip: string): string {
   return ip.split('.').slice(0, 3).join('.');
+}
+
+/**
+ * The device's own subnet base from the NATIVE module, or null.
+ *
+ * This is the reliable source and is tried before anything else. Android 11
+ * blocks /proc/net for apps, and guessing common ranges is exactly that -- a
+ * guess. See Ink2TaskNetModule for why it needs no permission of its own.
+ *
+ * Returns null (never throws) when the module is absent, which happens if
+ * Ink2TaskPackage did not make it into PluginConfig.json's reactPackages -- a
+ * documented build hazard, so this must degrade rather than fail.
+ */
+export async function nativeSubnet(): Promise<{base: string; ip: string; source: string} | null> {
+  try {
+    const mod = (NativeModules as any)?.Ink2TaskNet;
+    if (!mod?.getLocalIpv4) return null;
+    const res = await mod.getLocalIpv4();
+    const ip: string = res?.ip ?? '';
+    const prefix: number = res?.prefixLength ?? 24;
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return null;
+    // Only a /24 or narrower maps onto the .1-.254 sweep this module does. A
+    // wider mask (a /16, say) would need 65k probes, so treat the containing
+    // /24 as the best affordable guess rather than pretending to scan it all.
+    if (prefix < 24) {
+      console.log(`[Ink2Task] native ip ${ip}/${prefix}: wider than /24, sweeping its /24 only`);
+    }
+    return {base: base24(ip), ip, source: res?.source ?? 'native'};
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * /24 bases worth sweeping when /proc/net cannot be read.
+ *
+ * ANDROID 11 BLOCKS /proc/net FOR APPS. The Manta runs Android 11 (SDK 30) and
+ * SELinux labels those files `proc_net`, so an untrusted app gets EACCES even
+ * though the mode is world-readable -- `adb shell` can read them only because
+ * it runs as `shell`. The A5X was Android 8.1, where the read worked, so this
+ * silently regressed on newer hardware and discovery reported "no matching
+ * server" instantly, without probing anything (2026-08-23).
+ *
+ * Order matters: the /24 of an address the user already had working is by far
+ * the best guess (a router usually hands the Mac a new address in the SAME
+ * subnet), so it goes first. The rest are the common home ranges.
+ */
+export function fallbackSubnets(currentHost?: string): string[] {
+  const bases: string[] = [];
+  const add = (b: string) => {
+    if (b && !bases.includes(b)) bases.push(b);
+  };
+  if (currentHost && /^\d+\.\d+\.\d+\.\d+$/.test(currentHost.trim())) {
+    add(base24(currentHost.trim()));
+  }
+  for (const b of ['10.0.0', '192.168.1', '192.168.0', '10.0.1', '192.168.4', '172.20.10']) {
+    add(b);
+  }
+  return bases;
 }
 
 /**
@@ -80,12 +160,39 @@ export type Found = {host: string; port: number};
 
 type Probe = {ok: true; backend?: string} | null;
 
+/**
+ * Why probes failed during the last sweep. Counted, not logged per host: 254
+ * hosts x 5 ports is over a thousand attempts, and one line each would bury
+ * everything else.
+ *
+ * Exists because a sweep that finds nothing is otherwise indistinguishable
+ * between "swept fine, server absent" and "every request was refused before it
+ * left the device". The suspect for the latter: the plugin host targets SDK 35
+ * and declares neither usesCleartextTraffic nor a networkSecurityConfig, and
+ * Android blocks plain http:// by default from SDK 28 up. Our own manifest
+ * cannot change that -- it governs nothing, we run in the host's process.
+ */
+const probeErrors = new Map<string, number>();
+function noteProbeError(err: unknown): void {
+  let msg = err instanceof Error ? err.message : String(err);
+  // Collapse the host/port out so the same failure aggregates.
+  msg = msg.replace(/\b\d+\.\d+\.\d+\.\d+(:\d+)?/g, '<host>').slice(0, 120);
+  probeErrors.set(msg, (probeErrors.get(msg) ?? 0) + 1);
+}
+
 /** Probes one host:port's /health; returns the backend id if it's a Ink2Task server. */
 async function probe(host: string, port: number): Promise<Probe> {
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = setTimeout(() => ctrl?.abort(), HEALTH_TIMEOUT_MS);
   try {
-    const res = await fetch(`http://${host}:${port}/health`, ctrl ? {signal: ctrl.signal} : {});
+    // lanFetch routes around the cleartext block. On the native path it
+    // enforces the timeout at the socket level; the AbortController still
+    // covers the fallback fetch path.
+    const res = await lanFetch(
+      `http://${host}:${port}/health`,
+      ctrl ? {signal: ctrl.signal} : {},
+      HEALTH_TIMEOUT_MS,
+    );
     if (!res.ok) return null;
     const data = await res.json();
     // 'app' marks newer servers; 'ok' keeps discovery working against an older
@@ -94,7 +201,8 @@ async function probe(host: string, port: number): Promise<Probe> {
       return {ok: true, backend: typeof data.backend === 'string' ? data.backend : undefined};
     }
     return null;
-  } catch {
+  } catch (err) {
+    noteProbeError(err);
     return null;
   } finally {
     clearTimeout(timer);
@@ -151,13 +259,72 @@ async function scanPool(
  * known backend ports, and (when given) matches the desired backend so the
  * right server is picked even when both run on the same machine.
  */
-export async function discoverServer(port: number, backend?: string): Promise<Found | null> {
-  const bases = await candidateSubnets();
-  const ports = [...new Set([port, ...KNOWN_PORTS])];
+export async function discoverServer(
+  port: number,
+  backend?: string,
+  /** Currently configured host, if any -- its /24 is the best fallback guess. */
+  currentHost?: string,
+): Promise<Found | null> {
+  // Native first: it is the only source that actually KNOWS the answer.
+  const native = await nativeSubnet();
+  const detected = native ? [native.base] : await candidateSubnets();
+  const bases = detected.length > 0 ? detected : fallbackSubnets(currentHost);
+  const how = native
+    ? `native ${native.ip} via ${native.source}`
+    : detected.length
+      ? 'from /proc'
+      : 'FALLBACK, /proc unreadable and no native module';
+  probeErrors.clear();
+  // Ask the platform whether plain http:// is even allowed in this process
+  // before blaming the network. See Ink2TaskNetModule.getCleartextPolicy.
+  try {
+    const mod = (NativeModules as any)?.Ink2TaskNet;
+    if (mod?.getCleartextPolicy) {
+      const p = await mod.getCleartextPolicy();
+      if (p && p.permittedGlobally === false) {
+        console.log(
+          '[Ink2Task] cleartext http is blocked for this process ' +
+            `(global=${p.permittedGlobally} lan=${p.permittedForPrivateLan}) -- ` +
+            'probes go through the native socket instead. Not an error.',
+        );
+      } else {
+        console.log(
+          `[Ink2Task] cleartext allowed (global=${p?.permittedGlobally} ` +
+            `lan=${p?.permittedForPrivateLan}${p?.error ? ' err=' + p.error : ''})`,
+        );
+      }
+    }
+  } catch {
+    // diagnostic only
+  }
+  // A mangled port (a stray "8" was seen on device after editing the field)
+  // would otherwise add a useless probe per host. Keep only plausible ports.
+  const ports = [...new Set([port, ...KNOWN_PORTS])].filter(p => p >= 1024 && p <= 65535);
+  // Logged because this used to fail completely silently: on Android 11 the
+  // /proc read throws, `detected` is empty, and the old code returned null
+  // without probing a single host -- indistinguishable from "swept everything
+  // and found nothing".
+  console.log(
+    `[Ink2Task] discover: subnets=${JSON.stringify(bases)} (${how}) ` +
+      `ports=${JSON.stringify(ports)}`,
+  );
   for (const base of bases) {
     const hosts = Array.from({length: 254}, (_, i) => `${base}.${i + 1}`);
     const found = await scanPool(hosts, ports, backend);
-    if (found) return found;
+    if (found) {
+      console.log(`[Ink2Task] discover: found ${found.host}:${found.port} on ${base}.x`);
+      return found;
+    }
+    // Report WHY nothing answered, most common first. If every attempt failed
+    // with the same non-network reason, the sweep never really happened.
+    const summary = [...probeErrors.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([msg, n]) => `${n}x ${msg}`);
+    console.log(
+      `[Ink2Task] discover: nothing on ${base}.x` +
+        (summary.length ? ` -- errors: ${summary.join(' | ')}` : ' -- no errors recorded'),
+    );
   }
   return null;
 }

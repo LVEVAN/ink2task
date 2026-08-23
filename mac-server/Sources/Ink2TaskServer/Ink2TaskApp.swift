@@ -43,7 +43,14 @@ struct Ink2TaskServer {
     static func route(_ request: HTTPRequest, config: ServerConfig, reminders: ReminderStore) async -> HTTPResponse {
         switch (request.method, request.path) {
         case ("GET", "/health"):
-            return .json(["ok": true, "app": "ink2task", "backend": "apple", "listName": config.listName])
+            // `features` lists optional wire capabilities the plugin can check
+            // for; see the note on this key in todoist-server/src/server.ts.
+            // Empty here and expected to stay that way for subtasks: EventKit
+            // exposes no subtask API at all (Reminders.app's are private to
+            // the app), so this is a permanent limitation, not a version gap.
+            // Sent anyway so the plugin can tell a current server apart from
+            // one too old to report capabilities.
+            return .json(["ok": true, "app": "ink2task", "backend": "apple", "listName": config.listName, "features": [String]()])
 
         case ("GET", "/lists"):
             return .json(["lists": reminders.listNames()])

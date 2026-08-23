@@ -12,6 +12,12 @@
  */
 import RNFS from 'react-native-fs';
 import {PluginManager} from 'sn-plugin-lib';
+import {Dimensions, PixelRatio} from 'react-native';
+import {isMantaClass} from './deviceSize';
+// Safe: notePicker.ts imports nothing, so this cannot create a cycle. Needed so
+// the templated-page helpers below key on the SAME normalised path the SDK and
+// resolveTarget use -- configs can hold the old short form ("/Note/x.note").
+import {toAbsolute} from './notePicker';
 
 const CONFIG_DIR = '/storage/emulated/0/MyStyle/Ink2Task';
 const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
@@ -79,6 +85,49 @@ export type Ink2TaskConfig = {
   /** Scales the whole checklist (text, checkboxes, rows). 1 = default size. */
   listScale: number;
   /**
+   * Whether a sync may add pages to the checklist note so a long list can
+   * continue onto page 2 and 3 (see MAX_PAGES in ./pagination).
+   *
+   * ON by default (user's call, 2026-08-22): a long list silently truncating to
+   * one page is the more surprising behaviour of the two, and the pages are
+   * reclaimed automatically when the list shrinks again. `undefined` therefore
+   * reads as ON, which also switches the feature on for configs written before
+   * this field existed. Set false to keep everything on one page.
+   */
+  autoAddPages?: boolean;
+  /**
+   * Where a newly created task is placed in the list: at the END (default) or
+   * at the START. Applies to handwriting capture, lasso capture, and anything
+   * else that creates a task.
+   *
+   * Support is per backend, verified 2026-08-22 against real accounts:
+   *   Todoist      -- `order: 1` on create. (`child_order` is ignored on write.)
+   *   Google Tasks -- omit `previous`, which inserts at the top.
+   *   TickTick     -- `sortOrder`, a large negative value. UNVERIFIED on write.
+   *   Apple        -- not possible; EventKit exposes no ordering at all.
+   * On Apple the setting is simply inert rather than an error.
+   */
+  newTaskPosition?: 'start' | 'end';
+  /**
+   * How many leading pages of a note were created BY US from the Ink2Task
+   * template, keyed by absolute note path. ensureNote makes page 0, so 1 is the
+   * baseline; each continuation page this plugin adds bumps it.
+   *
+   * Exists because `isTemplatePage` (which decides whether to draw the chrome
+   * or trust a baked-in background) was inferred from `getNoteTotalPageNum()
+   * === 1`. That heuristic is a safety net for `getCurrentPageNum()`'s
+   * undocumented 0- vs 1-based indexing, and it silently stops working the
+   * moment a note has more than one page: on a 3-page note it would report the
+   * templated first page as un-templated and draw a SECOND SYNC button and DUE
+   * header on top of the baked ones (a bug already seen on-device once).
+   *
+   * Recording what we actually created removes the guess for our own pages.
+   * Pages the USER added with the device's note tools are still blank and still
+   * need their chrome drawn, which is why this is a count of leading pages
+   * rather than a flag on the note.
+   */
+  templatedPages?: {[notePath: string]: number};
+  /**
    * 24-hour ("military") time instead of 12-hour AM/PM for every time drawn
    * on the checklist page (DUE times, LAST UPDATED). Off (12-hour) by
    * default. Optional/undefined behaves as false, so existing configs from
@@ -132,27 +181,42 @@ const DEFAULT_NOTE_PATH = '/Note/Ink2Task/Ink2Task.note';
 const MANTA_NOTE_PATH = '/Note/Ink2Task/Ink2Task Manta.note';
 
 async function defaultNotePathForDevice(): Promise<string> {
+  // Same two-signal check the template uses (see isMantaClass): a real Manta
+  // was seen reporting itself as a Nomad, and the two must agree or the note
+  // and its baked template would be mismatched.
+  let deviceType: number | undefined;
   try {
-    const dt = await PluginManager.getDeviceType();
-    if (dt === 5) return MANTA_NOTE_PATH;
+    deviceType = await PluginManager.getDeviceType();
   } catch {}
-  return DEFAULT_NOTE_PATH;
+  const screen = Dimensions.get('screen');
+  return isMantaClass({deviceType, screen, pixelRatio: PixelRatio.get()})
+    ? MANTA_NOTE_PATH
+    : DEFAULT_NOTE_PATH;
 }
 
+// Hosts start EMPTY, not at a placeholder address.
+//
+// The old default was '192.168.1.0', which can never work: .0 is a network
+// address, not a host. Worse, it made a fresh install look configured, so the
+// first sync failed with "can't reach the server" as though something were
+// broken rather than simply unset -- and an empty host is what lets
+// taskCallWithAutoRecover know to go and FIND the server instead (2026-08-23).
 const DEFAULT_CONFIG: Ink2TaskConfig = {
-  host: '192.168.1.0',
+  host: '',
   port: 8942,
   listName: 'Inbox',
   profiles: [
-    {label: 'Apple Reminders', backend: 'apple', host: '192.168.1.0', port: 8942, listName: 'Inbox'},
+    {label: 'Apple Reminders', backend: 'apple', host: '', port: 8942, listName: 'Inbox'},
     {label: 'Google Tasks', backend: 'google', host: '', port: 8943, listName: 'Inbox'},
     {label: 'Todoist', backend: 'todoist', host: '', port: 8944, listName: 'Inbox'},
-    {label: 'TickTick', backend: 'ticktick', host: '192.168.1.0', port: 8955, listName: 'Inbox'},
+    {label: 'TickTick', backend: 'ticktick', host: '', port: 8955, listName: 'Inbox'},
   ],
   activeProfile: 0,
   notePath: DEFAULT_NOTE_PATH,
   fontPath: '',
   listScale: 1,
+  autoAddPages: true,
+  newTaskPosition: 'end',
 };
 
 async function ensureDir(): Promise<void> {
@@ -331,6 +395,15 @@ export type ChecklistEntry = {
    * the same reminder isn't drawn twice.
    */
   captured?: boolean;
+  /**
+   * Subtask nesting depth of this row as drawn: absent or 0 for a top-level
+   * task, 1 for a child, and so on. Derived from the backend's parentId chain
+   * at draw time (see subtaskDepths) and persisted here because the capture
+   * flow needs it: resolving a handwritten "> buy milk" to a parent means
+   * looking at the depth of the rows above it, and this registry is the only
+   * record of what the page currently shows.
+   */
+  depth?: number;
   /** Checkbox bounding box in screen coordinates. */
   box: {left: number; top: number; right: number; bottom: number};
   /**
@@ -568,12 +641,20 @@ export async function saveTaskSources(all: TaskSources): Promise<void> {
 /**
  * Per-task change-detection state, as of the last successful sync.
  *
- * `lastSyncedEtag` is what makes conflict detection possible at all: TickTick
- * tasks have no modified-time field (confirmed absent across every source
- * checked), but `etag` DOES change on every mutation -- device-verified
- * 2026-08-11 (an update visibly changed a task's etag). Comparing the
- * CURRENT remote etag against this tells us "has this task changed on
- * TickTick's side since we last looked," independent of what changed.
+ * `lastSyncedEtag` is what makes conflict detection possible at all: `etag`
+ * changes on every mutation -- device-verified 2026-08-11 (an update visibly
+ * changed a task's etag). Comparing the CURRENT remote etag against this
+ * tells us "has this task changed on TickTick's side since we last looked,"
+ * independent of what changed.
+ *
+ * Correction (2026-08-21): this comment used to justify the etag by claiming
+ * TickTick tasks have no modified-time field. They do. A live probe of
+ * GET /project/{id}/data returned `modifiedTime` on 7 of 7 tasks (it is
+ * undocumented, not absent). The etag is still the right signal for the
+ * question we actually ask here -- see the long note on TickTickTaskRaw.etag
+ * in ticktick-server/src/ticktick.ts for why, and for what `modifiedTime`
+ * would buy us if the conflict policy ever became last-write-wins instead
+ * of remote-wins.
  *
  * `lastSyncedDue` is separate from the etag check: it's what lets the ONE
  * real local-edit path in this UI today (handwriting a new date into an
@@ -692,4 +773,83 @@ export async function saveTicktickSyncMeta(meta: TickTickSyncMeta): Promise<void
   } catch (e) {
     console.log('Ink2Task: ticktick-sync-meta save failed', e);
   }
+}
+
+/**
+ * How many leading pages of `notePath` carry our baked-in template background.
+ *
+ * Defaults to 1 because ensureNote always creates page 0 from the template, so
+ * a config written before this field existed still gets the right answer for
+ * the only page it could have had.
+ */
+export function templatedPageCount(config: Ink2TaskConfig, notePath: string): number {
+  const n = config.templatedPages?.[toAbsolute(notePath)];
+  return typeof n === 'number' && n > 0 ? n : 1;
+}
+
+/**
+ * Returns a config recording that `notePath` now has `count` leading templated
+ * pages.
+ *
+ * GROWS by default: silently lowering the count would mean forgetting that a
+ * page we created has a baked background, and drawing its chrome a second time
+ * on top of it. Pass `{shrink: true}` only after a page has actually been
+ * REMOVED from the note, where lowering it is the correct bookkeeping.
+ */
+export function withTemplatedPages(
+  config: Ink2TaskConfig,
+  notePath: string,
+  count: number,
+  opts: {shrink?: boolean} = {},
+): Ink2TaskConfig {
+  const current = templatedPageCount(config, notePath);
+  if (opts.shrink) {
+    if (count >= current) return config;
+    return {
+      ...config,
+      templatedPages: {
+        ...(config.templatedPages ?? {}),
+        [toAbsolute(notePath)]: Math.max(1, count),
+      },
+    };
+  }
+  if (count <= current) return config;
+  return {
+    ...config,
+    templatedPages: {...(config.templatedPages ?? {}), [toAbsolute(notePath)]: count},
+  };
+}
+
+/** True when a page can be trusted to already have the template drawn into it. */
+export function isTemplatedPage(
+  config: Ink2TaskConfig,
+  notePath: string,
+  page: number,
+): boolean {
+  return page < templatedPageCount(config, notePath);
+}
+
+/**
+ * The FIRST page of the checklist run that `page` belongs to.
+ *
+ * Syncing while on a continuation page used to treat that page as the start of
+ * the list. The list then got redrawn from there, its own continuations landed
+ * further down the note, and the whole run walked toward the end of the note one
+ * sync at a time -- which is what left a device with 8 pages of stale checklists
+ * and a "PAGE 1 OF 3" sitting on page 4 (2026-08-22).
+ *
+ * A run starts at page 0, or at any page the user deliberately bound to its own
+ * list (that binding is what makes a page a list in its own right rather than a
+ * continuation of the one above). So: walk back to the nearest bound page, or 0.
+ */
+export function anchorPageFor(
+  config: Ink2TaskConfig,
+  notePath: string,
+  page: number,
+): number {
+  const path = toAbsolute(notePath);
+  for (let p = page; p > 0; p--) {
+    if (config.pageBindings?.[registryKey(path, p)]) return p;
+  }
+  return 0;
 }

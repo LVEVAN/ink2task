@@ -18,6 +18,14 @@ import {PluginFileAPI, PluginCommAPI, PluginManager, Element, Geometry, PointUti
 import type {RemoteReminder} from '../api/macServer';
 import type {ChecklistEntry, TaskSource, TaskSources} from './config';
 import {unwrap, recycleElements} from './sdk';
+import {
+  measureText,
+  fitTitle,
+  lineCount,
+  subtaskMarker,
+  subtaskDepths,
+  subtaskSiblingIndex,
+} from './taskText';
 
 /**
  * Elements are native-backed objects, not plain data: createElement allocates
@@ -62,18 +70,48 @@ const TPL_H = 1872;
 // side toolbar (which can sit on the left or right) never covers it.
 const HEADER_Y = 205 / TPL_H; // top of the first row / header line
 const ROW_H = 112 / TPL_H; // ruled row height
-const N_ROWS = 14; // rows the template provides (all non-task rows are writable)
+export const N_ROWS = 14; // rows the template provides (all non-task rows are writable)
 const DIVIDER_X = 1164 / TPL_W; // vertical divider between task and due columns
 
 const BOX_LEFT = 100 / TPL_W;
 const BOX_SIZE = 66 / TPL_W;
 const BOX_TOP_IN_ROW = 23 / TPL_H; // box inset from the top of its row cell
 
-const TASK_TEXT_LEFT = 196 / TPL_W;
+// Typed titles start just right of the checkbox (which ends at 166) rather than
+// well clear of it. The SDK's text renderer adds its own internal padding
+// inside textRect -- device capture (2026-08-21, A5X) showed glyphs landing
+// ~17px right of the rect's left edge -- so the rect at 172 puts the first
+// glyph near 189, roughly level with where the blank rows' capture box begins
+// (182). That keeps typed and handwritten rows visually aligned while closing
+// the dead gap the old 196 left between box and text. Also buys ~24px of extra
+// title width, so slightly fewer titles hit the two-line ellipsis.
+const TASK_TEXT_LEFT = 172 / TPL_W;
 const TASK_TEXT_RIGHT = 1140 / TPL_W; // stop before the divider (1164)
 const DUE_TEXT_LEFT = 1184 / TPL_W; // start after the divider (1164)
 const DUE_TEXT_RIGHT = 1304 / TPL_W; // right margin unchanged
+
+// The handwriting CAPTURE boxes are deliberately wider than the text bounds
+// above. Typed titles want breathing room from the checkbox and the divider,
+// but a capture rect that's inset for looks throws away writing space: capture
+// only reads strokes whose center falls inside the rect, so anything written
+// past the edge is silently dropped. Device feedback (2026-08-21, Manta) was
+// that dates in particular kept getting lost unless written small and centered.
+// So these run to within a few px of the template's own lines: the checkbox
+// (ends 166), the column divider (1164), and the right ruled margin (1320).
+// Left edge keeps a slightly bigger gap than the others: it's the one that
+// borders the checkbox, and a tick that overshoots its box shouldn't land a
+// stroke center inside the task's capture zone.
+const TASK_BOX_LEFT = 182 / TPL_W;
+const TASK_BOX_RIGHT = 1156 / TPL_W;
+const DUE_BOX_LEFT = 1172 / TPL_W;
+const DUE_BOX_RIGHT = 1314 / TPL_W;
 const FONT_SIZE = 40 / TPL_H; // base; scaled by the user's list-size setting
+
+// Subtask markers are ">" per level (">", ">>", ...) drawn BOLD, from
+// subtaskMarker() in ./taskText. This replaced a single thin "↳" which did
+// render on an A5X but read as faint and could not show nesting depth (device
+// feedback 2026-08-21). The same ">" is what capture parses back out of
+// handwriting, so the drawn form and the written form match deliberately.
 
 // The header label ("<platform> · <list>") drawn in the ruled-line margin
 // (x85), the SYNC button's old spot before the two swapped (2026-08-13,
@@ -226,13 +264,16 @@ function formatDueParts(due: string, use24h?: boolean): {date: string; time: str
   return {date, time};
 }
 
-// Average glyph width as a fraction of font size, used to estimate how much
-// text fits per line. Tuned against real titles on an A5X: 0.6 was too wide
-// (truncated titles that visibly still had room), 0.5 was STILL too wide
-// (titles cut ~5 characters early), 0.47 nudged very slightly too far the
-// other way. The renderer does the actual word-wrapping; this only decides
-// when a title is long enough to need an ellipsis.
-const CHAR_W = 0.485;
+// Task titles are measured per glyph by ../utils/taskText (measureText /
+// fitTitle / lineCount). The flat CHAR_W average that used to live here is
+// gone: no single number worked, because it charged 'i' and 'm' the same, so
+// titles full of narrow letters were ellipsized with a third of the row still
+// empty (device report 2026-08-21). Its tuning history is in that module.
+//
+// The HEADING below still uses a flat average, deliberately: it is one short
+// bold string with its own tuning history and a one-line-fits decision, and a
+// regression there means a clipped heading. Left alone on purpose.
+//
 // The platform/list heading is drawn BOLD (drawHeading passes bold=1), unlike
 // task titles -- bold glyphs run wider, so reusing CHAR_W there under-counted
 // width and let borderline labels ("Google Tasks - To Do List") pass the
@@ -241,24 +282,9 @@ const CHAR_W = 0.485;
 // (smaller) charsPerLine = triggers two-line mode sooner.
 const HEADER_CHAR_W = 0.58;
 
-/** Estimated characters per line for a given width and font size. */
-function charsPerLine(widthPx: number, fontSizePx: number, charW: number = CHAR_W): number {
+/** Estimated characters per line, for the bold heading's one-line-fits check. */
+function charsPerLine(widthPx: number, fontSizePx: number, charW: number = HEADER_CHAR_W): number {
   return Math.max(1, Math.floor(widthPx / (fontSizePx * charW)));
-}
-
-/**
- * Trims a title that would overflow the wrap area, adding a "..." ellipsis. The
- * renderer wraps for us; this only estimates capacity (charsPerLine * maxLines).
- */
-function fitTitle(
-  title: string,
-  widthPx: number,
-  fontSizePx: number,
-  maxLines = 2,
-): string {
-  const maxChars = charsPerLine(widthPx, fontSizePx) * maxLines;
-  if (title.length <= maxChars) return title;
-  return title.slice(0, Math.max(1, maxChars - 3)).replace(/\s+$/, '') + '...';
 }
 
 /**
@@ -319,6 +345,14 @@ export type ChecklistStyle = {
    */
   honorBackendOrder?: boolean;
   /**
+   * Exact text for the bottom-margin footer, from footerFor() in ./pagination.
+   * Empty string draws nothing. Undefined means "work it out yourself", which
+   * reproduces the pre-continuation behaviour of showing "+N MORE NOT SHOWN"
+   * when the list is longer than one page: only the caller knows how many pages
+   * this list spans, so only the caller can word it correctly.
+   */
+  footerText?: string;
+  /**
    * 24-hour ("military") time instead of 12-hour AM/PM, for every time this
    * module draws on the page: due times in the DUE column and the LAST
    * UPDATED footer. Off (12-hour) by default, matching how the checklist
@@ -336,6 +370,26 @@ export type ChecklistStyle = {
    * note whose background doesn't actually have them.
    */
   checkboxesBaked?: boolean;
+  /**
+   * Cap on how many blank writable rows to draw after the last task. Undefined
+   * means "fill every remaining row", which is what a single page or the LAST
+   * page of a list should do: the more blank rows, the more tasks the user can
+   * add in one sync.
+   *
+   * The caller sets this to 1 for a page that continues onto the next one.
+   * Those pages are normally full, but planPages keeps a parent and its
+   * subtasks together, so moving a block of 4 out of 3 remaining rows leaves a
+   * GAP -- and every slot in the gap used to become its own writable row. A
+   * page reading "CONTINUED ON PAGE 2" with three empty write boxes above the
+   * footer looks broken (device-reported 2026-08-23), and the extra rows buy
+   * nothing, since the list continues elsewhere anyway.
+   *
+   * Slots past the cap get nothing drawn and no registry entry, so they are
+   * plain empty rows. Note the row's checkbox outline may still be visible on
+   * our own template, where the outlines are part of the baked background and
+   * are not ours to hide -- see checkboxesBaked.
+   */
+  maxBlankRows?: number;
 };
 
 // Rectangle outline pen width for checkboxes and blank writable boxes.
@@ -388,6 +442,11 @@ export async function writeChecklist(
   const dueLeft = px(DUE_TEXT_LEFT);
   const dueRight = px(DUE_TEXT_RIGHT);
   const dividerX = px(DIVIDER_X);
+  // Capture-box edges, wider than the text bounds above -- see TASK_BOX_LEFT.
+  const taskBoxLeft = px(TASK_BOX_LEFT);
+  const taskBoxRight = px(TASK_BOX_RIGHT);
+  const dueBoxLeft = px(DUE_BOX_LEFT);
+  const dueBoxRight = px(DUE_BOX_RIGHT);
   // Font scales with the user's list-size setting, capped so it stays in the row.
   const fontSize = Math.min(Math.round(size.height * FONT_SIZE * scale), rowHeight - 24);
 
@@ -400,7 +459,11 @@ export async function writeChecklist(
 
   // Due date/time uses a smaller font so a stacked date + time fits the column.
   const dueFontSize = Math.max(18, Math.round(fontSize * 0.68));
-  const rectInset = Math.round(rowHeight * 0.12);
+  // Vertical inset of a capture box inside its ruled row. Kept small (a few px
+  // at the template's scale) for the same reason the boxes are wide: strokes
+  // whose center lands outside are dropped, and tall handwriting overshoots a
+  // short box. Just enough to keep the outline off the ruled lines.
+  const rectInset = Math.max(3, Math.round(rowHeight * 0.06));
   const rowTopOf = (slot: number) => headerY + slot * rowHeight;
   const slotOf = (boxTop: number) => Math.round((boxTop - boxTopInRow - headerY) / rowHeight);
 
@@ -572,12 +635,31 @@ export async function writeChecklist(
   // Wrapped, ellipsized, vertically-centered title. Returns the strike span.
   // When `source` is given (the task was lasso-captured from another note), the
   // title is drawn as an underlined LINK that jumps back to that note page.
-  const drawTitle = async (rowTop: number, title: string, source?: TaskSource) => {
-    const taskW = taskRight - taskLeft;
-    const perLine = charsPerLine(taskW, fontSize);
-    const displayTitle = fitTitle(title, taskW, fontSize);
+  const drawTitle = async (
+    rowTop: number,
+    title: string,
+    source?: TaskSource,
+    /** Sibling position among its parent's children; 0 for a top-level task. */
+    markerCount = 0,
+  ) => {
+    // The marker is drawn INLINE, as part of the title string.
+    //
+    // It was a separate bold element (textBold is per-element, so that is the
+    // only way to bold just the marker). On device that rendered as a tiny
+    // clipped tick sitting above the title's baseline: the marker element was
+    // top-aligned at rowTop while the title is vertically centred, and its rect
+    // was measured too tight. Inline is what the original "↳" did, and that DID
+    // render correctly, so correctness wins over bold here.
+    //
+    // Prefixing before fitTitle also means the marker counts against the
+    // available width, so a long subtask ellipsizes instead of overflowing.
+    const marker = subtaskMarker(markerCount);
+    const bodyLeft = taskLeft;
+    const titleText = marker ? `${marker} ${title}` : title;
+    const taskW = taskRight - bodyLeft;
+    const displayTitle = fitTitle(titleText, taskW, fontSize);
     const lineH = Math.round(fontSize * 1.3);
-    const blockH = (displayTitle.length > perLine ? 2 : 1) * lineH;
+    const blockH = lineCount(displayTitle, taskW, fontSize) * lineH;
     const tTop = rowTop + Math.max(2, Math.round((rowHeight - blockH) / 2));
     // Text is top-aligned and the SDK clips at the rect bottom, so run the rect all
     // the way to the row's bottom -- maximum descender room for g/y/p/j on the last
@@ -585,13 +667,13 @@ export async function writeChecklist(
     const tBottom = rowTop + rowHeight - 2;
     elementPromises.push(
       source
-        ? mkLink(displayTitle, taskLeft, taskRight, tTop, tBottom, source.notePath, source.page)
-        : mkText(displayTitle, taskLeft, taskRight, tTop, tBottom),
+        ? mkLink(displayTitle, bodyLeft, taskRight, tTop, tBottom, source.notePath, source.page)
+        : mkText(displayTitle, bodyLeft, taskRight, tTop, tBottom),
     );
     const textInset = Math.round(fontSize * 0.35);
-    const textStart = taskLeft + textInset;
-    const estWidth = Math.round(displayTitle.length * fontSize * CHAR_W);
-    const textEnd = textStart + Math.min(estWidth, taskW - textInset);
+    const textStart = bodyLeft + textInset;
+    const estWidth = Math.round(measureText(displayTitle, fontSize));
+    const textEnd = textStart + Math.min(estWidth, taskRight - textStart - textInset);
     return {textStart, textEnd};
   };
 
@@ -620,9 +702,9 @@ export async function writeChecklist(
   // sets it on the task. Sits between the divider and the right margin.
   const drawDueBox = async (rowTop: number) => {
     const rect = {
-      left: dividerX + Math.round(rowHeight * 0.12),
+      left: dueBoxLeft,
       top: rowTop + rectInset,
-      right: dueRight,
+      right: dueBoxRight,
       bottom: rowTop + rowHeight - rectInset,
     };
     elementPromises.push(mkRect(rect.left, rect.top, rect.right, rect.bottom));
@@ -733,19 +815,34 @@ export async function writeChecklist(
         );
       })();
 
+  // Nesting depth per task, derived from the parentId chain across the WHOLE
+  // list rather than just the drawn rows -- a parent can sit off-page (beyond
+  // N_ROWS) and its children still need to render as children.
+  const depths = subtaskDepths(reminders);
+  // The marker counts SIBLING POSITION, not depth: three subtasks of one parent
+  // read ">", ">>", ">>>". Depth is still what groups a parent with its children
+  // for page packing, so both are needed.
+  const siblingIndex = subtaskSiblingIndex(reminders);
+
   let slot = 0;
   for (const reminder of ordered) {
     if (slot >= N_ROWS) break;
     const rowTop = rowTopOf(slot);
     const box = await drawCheckbox(rowTop);
     if (reminder.priority) drawPriorityFlag(rowTop, reminder.priority);
+    const depth = depths.get(reminder.id) ?? 0;
     const {textStart, textEnd} = await drawTitle(
       rowTop,
       reminder.title,
       style.sources?.[reminder.id],
+      siblingIndex.get(reminder.id) ?? 0,
     );
     const entry: ChecklistEntry = {
       kind: 'synced', reminderId: reminder.id, title: reminder.title, box, textStart, textEnd,
+      // Persisted so handwriting capture can resolve "> foo" to a parent: it
+      // needs the depth of the rows ABOVE the one being captured, and the only
+      // record of the drawn page is this registry.
+      ...(depth > 0 ? {depth} : {}),
     };
     // Show the date if it has one; otherwise give it a box to write one into.
     if (reminder.due) await drawDue(rowTop, reminder.due);
@@ -755,14 +852,23 @@ export async function writeChecklist(
   }
 
   // Remaining slots become blank writable rows so every empty row is ready --
-  // a task box on the left and a DUE box on the right.
-  for (; slot < N_ROWS; slot++) {
+  // a task box on the left and a DUE box on the right. Continuation pages get
+  // these too: harvestPages captures from every drawn page, so a task written
+  // on page 2 or 3 is read back like any other.
+  //
+  // style.maxBlankRows caps how many, for a page whose list continues on the
+  // next one; see the comment on that field.
+  const blankLimit = style.maxBlankRows === undefined
+    ? N_ROWS
+    : Math.max(0, Math.min(N_ROWS, style.maxBlankRows));
+  const lastBlankSlot = Math.min(N_ROWS, slot + blankLimit);
+  for (; slot < lastBlankSlot; slot++) {
     const rowTop = rowTopOf(slot);
     const box = await drawCheckbox(rowTop);
     const rect = {
-      left: taskLeft,
+      left: taskBoxLeft,
       top: rowTop + rectInset,
-      right: taskRight,
+      right: taskBoxRight,
       bottom: rowTop + rowHeight - rectInset,
     };
     elementPromises.push(mkRect(rect.left, rect.top, rect.right, rect.bottom));
@@ -770,13 +876,23 @@ export async function writeChecklist(
     entries.push({kind: 'blank', title: '', box, rect, dueRect});
   }
 
-  // If the list is longer than the page fits, note how many are hidden. They
-  // surface as you complete tasks above and the list compacts on the next sync.
+  // Footer line. The caller decides the wording, because only it knows whether
+  // this page is one of several (see planPages / footerFor in ./pagination):
+  // a middle page points at the next one, the last page reports what still did
+  // not fit, and a lone page keeps the original "+N MORE NOT SHOWN" behaviour.
+  // Falls back to computing the single-page case itself so a caller that passes
+  // no footer (or an older call site) still behaves as it always did.
   const hiddenCount = ordered.length - N_ROWS;
-  if (hiddenCount > 0) {
+  const footerText =
+    style.footerText !== undefined
+      ? style.footerText
+      : hiddenCount > 0
+        ? `+ ${hiddenCount} MORE NOT SHOWN`
+        : '';
+  if (footerText) {
     elementPromises.push(
       mkText(
-        `+ ${hiddenCount} MORE NOT SHOWN`,
+        footerText,
         px(FOOTER_LEFT),
         px(FOOTER_RIGHT),
         py(FOOTER_TOP),

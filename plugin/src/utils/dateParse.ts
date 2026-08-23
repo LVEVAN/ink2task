@@ -136,3 +136,23 @@ export function parseDueDate(raw: string, now: Date = new Date()): string | null
 
   return null;
 }
+
+/**
+ * Formats a stored due value for display in a DIALOG (the sync summary's
+ * "Added due date:" lines), as MM/DD/YY.
+ *
+ * Deliberately separate from formatDueParts in checklistPage.ts, which renders
+ * the page's DUE column as "Nov 1" and stays that way: the column is narrow and
+ * the month name reads faster there, whereas the dialog previously showed the
+ * raw ISO string ("2026-07-29") straight from storage.
+ *
+ * Accepts "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" and ignores any time part, since
+ * the dialog line is a confirmation rather than a full record. Anything that
+ * isn't a recognisable ISO date is passed through untouched, so a future format
+ * degrades to showing the raw value instead of throwing mid-sync.
+ */
+export function formatDueForDialog(due: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(due);
+  if (!m) return due;
+  return `${m[2]}/${m[3]}/${m[1].slice(2)}`;
+}

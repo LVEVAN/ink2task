@@ -1,4 +1,6 @@
 import RNFS from 'react-native-fs';
+import {Dimensions, PixelRatio} from 'react-native';
+import {isMantaClass} from './deviceSize';
 import {PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {toAbsolute} from './notePicker';
 import {TEMPLATE_PNG_BASE64} from './templateAsset';
@@ -68,11 +70,31 @@ export const CHECKBOX_BAKE_VERSION = 11;
  * so redesigns don't require manually deleting the old PNG).
  */
 async function templateBase64ForDevice(): Promise<string> {
+  const manta = await detectMantaClass();
+  return manta ? TEMPLATE_MANTA_PNG_BASE64 : TEMPLATE_PNG_BASE64;
+}
+
+/**
+ * Manta-class check that does not trust the device-type enum alone -- see
+ * isMantaClass. Logs both signals, because baking the wrong template into a
+ * note is invisible until you look closely at a blurry background, and there is
+ * no API to change a note's background afterwards.
+ */
+async function detectMantaClass(): Promise<boolean> {
+  let deviceType: number | undefined;
   try {
-    const dt = await PluginManager.getDeviceType();
-    if (dt === 5) return TEMPLATE_MANTA_PNG_BASE64;
-  } catch {}
-  return TEMPLATE_PNG_BASE64;
+    deviceType = await PluginManager.getDeviceType();
+  } catch {
+    // enum unavailable; the screen size below is then the only signal
+  }
+  const screen = Dimensions.get('screen');
+  const manta = isMantaClass({deviceType, screen, pixelRatio: PixelRatio.get()});
+  console.log(
+    `[Ink2Task] device: type=${deviceType ?? '?'} screen=${screen.width}x${screen.height}dp ` +
+      `ratio=${PixelRatio.get()} ` +
+      `-> ${manta ? 'MANTA' : 'standard'} template`,
+  );
+  return manta;
 }
 
 async function ensureTemplate(): Promise<void> {
@@ -168,4 +190,94 @@ export async function noteHasBakedInCheckboxes(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * How many pages the note currently has, or 0 if it cannot be determined.
+ * Never throws: a failed read must not take a sync down with it.
+ */
+export async function notePageCount(notePath: string): Promise<number> {
+  try {
+    const res: any = await PluginFileAPI.getNoteTotalPageNum(toAbsolute(notePath));
+    const n = typeof res === 'number' ? res : res?.result;
+    return typeof n === 'number' && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Appends one page to the checklist note, built from the SAME template as page 0.
+ *
+ * Using the template (rather than an inserted blank page) is what lets a
+ * continuation page look identical to the first: the ruled rows, DUE column,
+ * divider, and SYNC button are baked into its background, so the checklist can
+ * be drawn on it with `drawChrome: false` exactly like page 0. A blank inserted
+ * page would need all of that redrawn as elements on every sync.
+ *
+ * Returns true only when the page really was added, verified by re-reading the
+ * page count rather than trusting the response shape: createNote is documented
+ * to resolve with `success: false` instead of throwing, and insertNotePage sits
+ * behind the same wrapper, so a silent failure is the likely mode.
+ *
+ * Caller must record the new templated page (see withTemplatedPages in
+ * ./config), otherwise the next sync will think the page is un-templated and
+ * draw a second SYNC button on top of the baked one.
+ */
+export async function appendTemplatedPage(notePath: string): Promise<boolean> {
+  const absolutePath = toAbsolute(notePath);
+  await ensureTemplate();
+  const before = await notePageCount(absolutePath);
+  try {
+    // `page` is where the new page goes. Appending means the current count,
+    // i.e. one past the last 0-indexed page.
+    const res: any = await PluginFileAPI.insertNotePage({
+      notePath: absolutePath,
+      page: before,
+      template: toAbsolute(TEMPLATE),
+    });
+    if (res && typeof res === 'object' && 'success' in res && !res.success) {
+      const {message = 'unknown error', code = '?'} = res.error ?? {};
+      console.log(`[Ink2Task] insertNotePage failed (${code}): ${message}`);
+      return false;
+    }
+  } catch (e: any) {
+    console.log('[Ink2Task] insertNotePage threw:', e?.message);
+    return false;
+  }
+  const after = await notePageCount(absolutePath);
+  // If the count could not be read at all (0), fall back to trusting the call.
+  return after === 0 ? true : after > before;
+}
+
+/**
+ * Removes one page from the note. Returns true only if the page count actually
+ * dropped, so a silent `success: false` cannot be mistaken for a deletion.
+ *
+ * DESTRUCTIVE. Callers must have already established that the page is one we
+ * created, is past what the list needs, carries no ink, and is not bound to
+ * another list -- see pagesToReclaim in ./pagination, which is where those
+ * conditions live and are tested. This function deliberately checks none of
+ * them: it is the mechanism, not the policy.
+ */
+export async function removeNotePageAt(notePath: string, page: number): Promise<boolean> {
+  const absolutePath = toAbsolute(notePath);
+  const before = await notePageCount(absolutePath);
+  // Refuse to empty the note entirely, whatever the caller thinks.
+  if (before <= 1) return false;
+  try {
+    const res: any = await PluginFileAPI.removeNotePage(absolutePath, page);
+    if (res && typeof res === 'object' && 'success' in res && !res.success) {
+      const {message = 'unknown error', code = '?'} = res.error ?? {};
+      console.log(`[Ink2Task] removeNotePage(${page}) failed (${code}): ${message}`);
+      return false;
+    }
+  } catch (e: any) {
+    console.log('[Ink2Task] removeNotePage threw:', e?.message);
+    return false;
+  }
+  const after = await notePageCount(absolutePath);
+  // Unknown count (0) means the check itself failed; report failure rather than
+  // claiming a deletion we cannot see, since the caller decrements state on true.
+  return after > 0 && after < before;
 }

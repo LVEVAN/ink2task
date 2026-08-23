@@ -199,6 +199,39 @@ sudo systemctl enable --now ink2task-todoist
 journalctl -u ink2task-todoist -f   # follow logs
 ```
 
+## Updating
+
+This server and the tablet plugin update **separately**, and neither notices
+when the other is out of date. When a release changes both, update both.
+
+Open a terminal in the folder you cloned. On Mac that is the **Terminal** app
+(Spotlight search, or Applications > Utilities > Terminal); on Windows, press
+Start and type **PowerShell**. Then `cd` into the folder and run:
+
+```bash
+git pull
+npm install
+```
+
+`npm install` is only needed when dependencies changed, but running it is
+harmless. Then restart the server so it picks up the new code:
+
+- Running it in a terminal: press **Ctrl+C**, then `npm start` again.
+- pm2: `pm2 restart ink2task-todoist`
+- systemd (Linux/Pi): `sudo systemctl restart ink2task-todoist`
+- macOS LaunchAgent: `launchctl kickstart -k gui/$(id -u)/com.ink2task.todoist`
+
+**Restarting alone is not enough if you run the server from a copy** somewhere
+other than the folder you just pulled into. A service restart reloads whatever
+code is in its own working directory, so check the service's working directory
+matches the folder you pulled. This is a common way to "update" a server and
+have nothing change.
+
+To confirm the two halves agree, open **Settings** in the plugin and tap **Test
+my setup**. It reports in plain language if the server is older than the plugin.
+An out-of-date server still syncs correctly, it just misses newer display
+details such as the subtask marker.
+
 ## Endpoints
 
 Identical shapes to the other backends:

@@ -26,8 +26,18 @@ type Task = {
   due?: {date?: string; datetime?: string | null} | null;
   /** Todoist's own scale: 4=p1 (urgent, red flag) down to 1=p4 (normal, no flag). */
   priority?: number;
-  /** Position within the project (what drag-to-reorder in the Todoist app changes). */
+  /**
+   * Position within the project (what drag-to-reorder in the app changes).
+   *
+   * v1 actually returns this as `child_order`; `order` is what the older REST v2
+   * called it and is absent here. Live-verified 2026-08-22 -- which means the
+   * old `sort((a,b) => a.order - b.order)` was sorting by undefined and doing
+   * nothing at all. Both names are read so either shape works.
+   */
   order?: number;
+  child_order?: number;
+  /** Set when the task is a subtask; null/absent for top-level tasks. */
+  parent_id?: string | null;
 };
 
 /** A v1 list response: cursor-paginated wrapper (older API returned a bare array). */
@@ -111,9 +121,9 @@ export async function todoistReminders(token: string, listName: string): Promise
   return tasks
     .filter(t => t.id && typeof t.content === 'string')
     // The API doesn't guarantee list order matches the app's manual
-    // (drag-to-reorder) order -- `order` is the field that actually reflects
-    // it, so sort explicitly rather than trusting whatever order it returned.
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    // (drag-to-reorder) order, so sort explicitly. v1 calls the field
+    // `child_order`; `order` is the v2 name, kept as a fallback.
+    .sort((a, b) => orderOf(a) - orderOf(b))
     .map(t => {
       const out: RemoteReminder = {id: t.id, title: t.content.trim() || '(untitled)'};
       // v1 puts the time inside due.date ("2026-07-29T13:00:00"); v2 had a
@@ -126,8 +136,38 @@ export async function todoistReminders(token: string, listName: string): Promise
       // Mirror that exactly: 5 - raw gives the UI number, and raw 1 is skipped
       // so a plain, never-prioritized task stays flag-free, same as in Todoist.
       if (t.priority && t.priority > 1) out.priority = (5 - t.priority) as 1 | 2 | 3;
+      // `/tasks` returns subtasks inline with their parents, so pass the link
+      // through and let the page mark them (checklistPage's SUBTASK_PREFIX).
+      if (t.parent_id) out.parentId = t.parent_id;
       return out;
     });
+}
+
+/** A task's manual position, under either the v1 or v2 field name. */
+function orderOf(t: Task): number {
+  return t.child_order ?? t.order ?? 0;
+}
+
+/**
+ * The `order` value that puts a new task strictly FIRST in its project.
+ *
+ * `order: 1` is not enough: it TIES with anything already sitting at 1, and
+ * Todoist keeps both (device 2026-08-22 -- two "at the start" captures both
+ * landed at child_order 1, so the second appeared second). Negative values are
+ * accepted and sort ahead of everything, verified live, so go one below the
+ * current minimum. Each subsequent "at the start" task therefore lands above
+ * the previous one, which is what adding to the top should do.
+ */
+async function firstOrder(token: string, projectId: string): Promise<number> {
+  try {
+    const tasks = await getAll<Task>(token, `/tasks?project_id=${encodeURIComponent(projectId)}`);
+    const top = tasks.filter(t => !t.parent_id);
+    if (top.length === 0) return 1;
+    return Math.min(...top.map(orderOf)) - 1;
+  } catch {
+    // Position is a nicety; never fail a capture over it.
+    return 1;
+  }
 }
 
 /**
@@ -139,10 +179,20 @@ export async function todoistCreate(
   listName: string,
   title: string,
   due?: string | null,
+  /** Creates it as a subtask of this task id (Todoist nests up to 5 deep). */
+  parentId?: string,
+  /** Put it at the TOP of the list instead of appending. */
+  atStart?: boolean,
 ): Promise<{id: string; title: string}> {
   const id = await projectId(token, listName);
   const body: Record<string, unknown> = {content: title, project_id: id};
   if (due) body.due_date = due;
+  // Todoist derives the child's project from the parent, but sending both is
+  // consistent with the non-subtask path and matches what the API documents.
+  if (parentId) body.parent_id = parentId;
+  // Note `child_order` is NOT honoured as a REQUEST field (sending it appends
+  // instead); `order` is the one that works on create.
+  if (atStart) body.order = await firstOrder(token, id);
   const res = await td(token, '/tasks', {method: 'POST', body: JSON.stringify(body)});
   const task = (await res.json()) as Task;
   if (!task.id) throw new Error('Todoist did not return a task id');

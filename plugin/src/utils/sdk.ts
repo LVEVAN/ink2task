@@ -92,7 +92,34 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, what: stri
  * Google error code -- so this branch should only ever fire against an
  * older server version, or some other path that still leaks the raw code.
  */
-export function friendlyErrorMessage(raw: string): string {
+/**
+ * True when `raw` is a backend rejecting our credentials rather than anything
+ * to do with the network or the list. Matches the status text every backend
+ * puts in its thrown message ("Todoist 401: {...}") plus the words the servers
+ * use in a JSON error body.
+ */
+export function isAuthFailure(raw: string): boolean {
+  return (
+    /\b(401|403)\b/.test(raw) ||
+    /unauthorized|invalid[_ -]?token|invalid[_ -]?api[_ -]?key|forbidden|authentication failed/i.test(
+      raw,
+    )
+  );
+}
+
+export function friendlyErrorMessage(raw: string, serviceLabel?: string): string {
+  // Checked before anything else: an auth failure's raw text is a wall of JSON
+  // (Todoist 401 returns error_code/event_id/retry_after/error_tag), which told
+  // the user nothing about the one thing that was actually wrong -- the token.
+  if (isAuthFailure(raw)) {
+    const who = serviceLabel || 'The service';
+    return (
+      `${who} rejected the token, so nothing was synced. ` +
+      'Open Settings and type it in again slowly -- one wrong character is enough, ' +
+      'and the field cannot paste, so it has to be typed by hand. ' +
+      'Check the end of it especially.'
+    );
+  }
   if (/network request failed/i.test(raw)) {
     return "Couldn't reach the sync server -- check you're online and on the right Wi-Fi.";
   }

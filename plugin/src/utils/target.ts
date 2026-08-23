@@ -15,6 +15,7 @@ import {PluginCommAPI, PluginFileAPI, PluginManager, PluginNoteAPI, FileUtils} f
 import {unwrap} from './sdk';
 import {toAbsolute} from './notePicker';
 import type {Ink2TaskConfig} from './config';
+import {isTemplatedPage} from './config';
 
 export type Target = {
   notePath: string;
@@ -56,7 +57,12 @@ export async function resolveTarget(config: Ink2TaskConfig): Promise<Target> {
   const page = await unwrap<number>(PluginCommAPI.getCurrentPageNum(), 'getCurrentPageNum');
   const resolvedPage = typeof page === 'number' ? page : FIRST_PAGE;
 
-  let isTemplatePage = resolvedPage === FIRST_PAGE;
+  // Pages this plugin created from the template are known, not guessed: it
+  // records them as it makes them (see withTemplatedPages). This is what makes
+  // continuation pages safe. The two inferences below stay as fallbacks for
+  // notes predating that record.
+  let isTemplatePage =
+    resolvedPage === FIRST_PAGE || isTemplatedPage(config, notePath, resolvedPage);
   if (!isTemplatePage) {
     // Unlike PluginFileAPI's page params, getCurrentPageNum's own indexing
     // convention (0- vs 1-based) is undocumented -- if it's actually

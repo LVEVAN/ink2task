@@ -10,6 +10,10 @@
  * mac-server/ for that half.
  */
 import type {Ink2TaskConfig} from '../utils/config';
+// LAN calls go through lanFetch, which routes around Android's cleartext block
+// when it is in force. See utils/lanHttp.ts.
+import {lanFetch} from '../utils/lanHttp';
+import type {LanResponse} from '../utils/lanHttp';
 import {isDirectTodoist, activeProfileOf} from '../utils/config';
 import {
   todoistLists,
@@ -25,6 +29,11 @@ import {ticktickMoveReminder, ticktickDeleteReminder} from './ticktick';
 // instead of this file's generic ones, specifically so this import can exist.
 // See the comment on those functions in api/ticktick.ts.
 import {pushTicktickDue, pushTicktickFields} from '../utils/ticktickSync';
+// Capability negotiation lives in its own import-free module so it stays unit
+// testable; re-exported here so callers have one place to import from.
+import type {HealthResult} from './serverFeatures';
+export type {HealthResult, ServerFeature} from './serverFeatures';
+export {serverMissingSubtasks} from './serverFeatures';
 
 export type RemoteReminder = {
   id: string;
@@ -54,12 +63,32 @@ export type RemoteReminder = {
    */
   notes?: string;
   /**
-   * Change-detection signal, TickTick only. TickTick tasks have no
-   * modified-time field, but `etag` changes on every mutation (device-
-   * verified) -- see TickTickSyncRecord in ../utils/config.ts for how this
-   * drives conflict detection.
+   * Change-detection signal, TickTick only. `etag` changes on every mutation
+   * (device-verified) -- see TickTickSyncRecord in ../utils/config.ts for how
+   * this drives conflict detection. TickTick DOES also expose an undocumented
+   * `modifiedTime` (live-verified 2026-08-21); we don't send it, because
+   * nothing here orders competing edits. See the note on TickTickTaskRaw.etag
+   * in ticktick-server/src/ticktick.ts.
    */
   etag?: string;
+  /**
+   * Id of this task's parent, when it is a subtask. Per backend:
+   *
+   * - Todoist (both the direct path and todoist-server): documented
+   *   `parent_id`, reliable.
+   * - Google Tasks: documented `parent`, one level of nesting only.
+   * - Apple: never set. EventKit has no subtask API at all -- Reminders.app's
+   *   subtasks are private to the app. This is a hard blocker, not a gap.
+   * - TickTick: undocumented `parentId`, but live-verified 2026-08-21 against
+   *   a real account -- see TickTickTaskRaw.parentId in ticktick-server for
+   *   the evidence and for why `items[]` is a different thing.
+   *
+   * Every backend returns parents and children in one flat list, so without
+   * this a subtask was indistinguishable from a top-level task. Drives ONLY the
+   * marker drawn by checklistPage.ts (see SUBTASK_PREFIX) -- it does not affect
+   * row order, and the parent may not even be on the page. Purely additive.
+   */
+  parentId?: string;
 };
 
 /** The active profile's Todoist token (only meaningful in direct-Todoist mode). */
@@ -134,7 +163,7 @@ function baseUrl(config: Ink2TaskConfig): string {
  * else. Falls back to the generic message if the body isn't JSON or has no
  * `error` field (e.g. an unexpected proxy/gateway response).
  */
-async function describeError(res: Response, fallback: string): Promise<string> {
+async function describeError(res: LanResponse, fallback: string): Promise<string> {
   try {
     const data = await res.json();
     if (data && typeof data.error === 'string' && data.error) return data.error;
@@ -145,20 +174,25 @@ async function describeError(res: Response, fallback: string): Promise<string> {
 }
 
 /** Confirms the Mac server is reachable and talking to the right list. */
-export async function checkHealth(
-  config: Ink2TaskConfig,
-): Promise<{ok: true; listName: string} | {ok: false; error: string}> {
+export async function checkHealth(config: Ink2TaskConfig): Promise<HealthResult> {
   try {
     if (isDirectTodoist(config)) {
       await todoistCheck(token(config));
-      return {ok: true, listName: config.listName};
+      // No server in this mode: the plugin calls Todoist itself, so its
+      // capabilities are exactly this plugin's own and can never lag.
+      return {ok: true, listName: config.listName, backend: 'todoist', features: ['subtasks']};
     }
-    const res = await withTimeout(fetch(`${baseUrl(config)}/health`), config);
+    const res = await withTimeout(lanFetch(`${baseUrl(config)}/health`), config);
     if (!res.ok) {
       return {ok: false, error: await describeError(res, `Server returned ${res.status}`)};
     }
     const data = await res.json();
-    return {ok: true, listName: data.listName};
+    return {
+      ok: true,
+      listName: data.listName,
+      backend: typeof data.backend === 'string' ? data.backend : undefined,
+      features: Array.isArray(data.features) ? data.features.filter((f: unknown) => typeof f === 'string') : undefined,
+    };
   } catch (e: any) {
     return {ok: false, error: e?.message || 'Could not reach the server'};
   }
@@ -167,7 +201,7 @@ export async function checkHealth(
 /** Lists the names of every list, for the on-device list picker. */
 export async function fetchLists(config: Ink2TaskConfig): Promise<string[]> {
   if (isDirectTodoist(config)) return todoistLists(token(config));
-  const res = await withTimeout(fetch(`${baseUrl(config)}/lists`), config);
+  const res = await withTimeout(lanFetch(`${baseUrl(config)}/lists`), config);
   if (!res.ok) {
     throw new Error(await describeError(res, `Server returned ${res.status} while loading lists`));
   }
@@ -181,7 +215,7 @@ export async function fetchReminders(
 ): Promise<RemoteReminder[]> {
   if (isDirectTodoist(config)) return todoistReminders(token(config), config.listName);
   const res = await withTimeout(
-    fetch(`${baseUrl(config)}/reminders?list=${encodeURIComponent(config.listName)}`),
+    lanFetch(`${baseUrl(config)}/reminders?list=${encodeURIComponent(config.listName)}`),
     config,
   );
   if (!res.ok) {
@@ -203,7 +237,7 @@ export async function completeReminders(
   if (ids.length === 0) return {completed: [], failed: []};
   if (isDirectTodoist(config)) return todoistComplete(token(config), ids);
   const res = await withTimeout(
-    fetch(`${baseUrl(config)}/complete`, {
+    lanFetch(`${baseUrl(config)}/complete`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       // `list` tells the Google backend which task list the ids live in; the
@@ -228,13 +262,33 @@ export async function createReminder(
   config: Ink2TaskConfig,
   title: string,
   due?: string | null,
+  /**
+   * Makes the new task a subtask of this id (from a handwritten ">" marker,
+   * see parseSubtaskPrefix). Ignored by backends that cannot nest: mac-server
+   * has no subtask API to call, so a ">" there quietly produces a normal task.
+   */
+  parentId?: string,
 ): Promise<{id: string; title: string}> {
-  if (isDirectTodoist(config)) return todoistCreate(token(config), config.listName, title, due);
+  // A SUBTASK never honours "at the start". Position is relative to the parent's
+  // own children, so sending a first-in-project order would either fight the
+  // parent or pull the child away from it. Appending puts it as the parent's
+  // last child, which is where a newly added subtask belongs. The setting
+  // itself is untouched -- this is per-task, for this create only.
+  const atStart = config.newTaskPosition === 'start' && !parentId;
+  if (isDirectTodoist(config)) {
+    return todoistCreate(token(config), config.listName, title, due, parentId, atStart);
+  }
   const res = await withTimeout(
-    fetch(`${baseUrl(config)}/reminders`, {
+    lanFetch(`${baseUrl(config)}/reminders`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({title, list: config.listName, ...(due ? {due} : {})}),
+      body: JSON.stringify({
+        title,
+        list: config.listName,
+        ...(due ? {due} : {}),
+        ...(parentId ? {parentId} : {}),
+        ...(atStart ? {position: 'start'} : {}),
+      }),
     }),
     config,
   );
@@ -266,7 +320,7 @@ export async function updateReminderDue(
   if (activeProfileOf(config).backend === 'ticktick') return pushTicktickDue(config, id, due);
   if (activeProfileOf(config).backend === 'google') {
     const res = await withTimeout(
-      fetch(`${baseUrl(config)}/set-due`, {
+      lanFetch(`${baseUrl(config)}/set-due`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({id, due, list: config.listName}),
@@ -333,7 +387,7 @@ export async function uncompleteReminders(
 ): Promise<{uncompleted: string[]; failed: string[]}> {
   if (ids.length === 0) return {uncompleted: [], failed: []};
   const res = await withTimeout(
-    fetch(`${baseUrl(config)}/uncomplete`, {
+    lanFetch(`${baseUrl(config)}/uncomplete`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ids}),

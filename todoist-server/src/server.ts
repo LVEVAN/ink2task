@@ -127,6 +127,13 @@ async function main(): Promise<void> {
           app: 'ink2task',
           backend: 'todoist',
           listName: config.listName,
+          // Optional wire capabilities the plugin can check for. Presence of
+          // this key at all is the signal that matters: a server too old to
+          // send it omits it entirely, so the plugin can tell "out of date"
+          // apart from "up to date and genuinely supports nothing extra"
+          // (which would be `[]`). Version numbers are useless for this --
+          // every server here still reports package.json 0.1.0.
+          features: ['subtasks'],
         });
       }
 
@@ -153,7 +160,9 @@ async function main(): Promise<void> {
         }
         const listName = typeof body.list === 'string' ? body.list : config.listName;
         const projectId = await findProjectId(config, listName);
-        const created = await createTask(config, projectId, title);
+        const parentId = typeof body.parentId === 'string' ? body.parentId : undefined;
+        const atStart = body.position === 'start';
+        const created = await createTask(config, projectId, title, parentId, atStart);
         return sendJson(res, 200, created);
       }
 

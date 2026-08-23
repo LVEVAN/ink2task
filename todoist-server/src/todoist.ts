@@ -19,6 +19,8 @@ export type RemoteTask = {
   title: string;
   /** "YYYY-MM-DD", or "YYYY-MM-DDTHH:MM" when the task has a time, or omitted. */
   due?: string;
+  /** Parent task id when this is a subtask; omitted for top-level tasks. */
+  parentId?: string;
 };
 
 export class ListNotFoundError extends Error {
@@ -33,6 +35,8 @@ type Task = {
   id: string;
   content: string;
   due?: {date?: string; datetime?: string | null} | null;
+  /** Set when the task is a subtask; null/absent for top-level tasks. */
+  parent_id?: string | null;
 };
 
 /** Fetches a Todoist REST endpoint with the Bearer token; throws on non-2xx. */
@@ -104,6 +108,9 @@ export async function listOpenTasks(
       // `date` (date-only). Map to the plugin's "YYYY-MM-DD[THH:MM]" format.
       if (t.due?.datetime) out.due = t.due.datetime.slice(0, 16);
       else if (t.due?.date) out.due = t.due.date.slice(0, 10);
+      // Subtasks come back inline with their parents in this flat list, so
+      // pass the link through for the page to mark.
+      if (t.parent_id) out.parentId = t.parent_id;
       return out;
     });
 }
@@ -113,11 +120,26 @@ export async function createTask(
   config: ServerConfig,
   projectId: string,
   title: string,
+  /** Creates it as a subtask of this task id. Todoist nests up to 5 deep. */
+  parentId?: string,
+  /** Put it at the TOP of the list instead of appending. */
+  atStart?: boolean,
 ): Promise<{id: string; title: string}> {
   const res = await api(config, '/tasks', {
     method: 'POST',
     // Todoist calls the title field "content".
-    body: JSON.stringify({content: title, project_id: projectId}),
+    body: JSON.stringify({
+      content: title,
+      project_id: projectId,
+      ...(parentId ? {parent_id: parentId} : {}),
+      // This server talks REST v2, where the field really is `order` (the
+      // plugin's direct v1 path sees `child_order` instead -- see
+      // plugin/src/api/todoist.ts). `order: 1` TIES with anything already at 1,
+      // so a negative value is used: verified live on v1 that negatives are
+      // accepted and sort ahead of everything. Not re-verified on v2, and the
+      // worst case is the task landing near rather than at the top.
+      ...(atStart ? {order: -1} : {}),
+    }),
   });
   const task = (await res.json()) as Task;
   if (!task.id) throw new Error('Todoist did not return a task id');

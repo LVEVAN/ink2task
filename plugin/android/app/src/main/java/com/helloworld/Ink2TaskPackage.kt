@@ -34,7 +34,10 @@ import com.facebook.react.uimanager.ViewManager
 class Ink2TaskPackage : ReactPackage {
     override fun createNativeModules(
         reactContext: ReactApplicationContext,
-    ): List<NativeModule> = listOf(Ink2TaskOverlayModule(reactContext))
+    ): List<NativeModule> = listOf(
+        Ink2TaskOverlayModule(reactContext),
+        Ink2TaskNetModule(reactContext),
+    )
 
     override fun createViewManagers(
         reactContext: ReactApplicationContext,

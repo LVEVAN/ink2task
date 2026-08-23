@@ -43,11 +43,11 @@ https://github.com/user-attachments/assets/f8f735c9-a9c2-4331-af06-d9e6e91994d2
 - **Priority flags** -- a small flag + number shows each task's priority
   (Todoist's p1-p4, Apple Reminders' flag tiers). Visual only -- it never
   reorders the list out from under you.
-- **Follows your app's own order** -- for Google Tasks and Todoist, dragging a
-  task to a new spot in the app moves it here too on the next sync. (Apple
-  Reminders and TickTick don't expose a reliable manual order through their
-  APIs, so those two stay in creation-date order instead -- a new task,
-  handwritten or lassoed, always lands at the bottom.)
+- **Follows your app's own order** -- for Google Tasks, Todoist, and TickTick,
+  dragging a task to a new spot in the app moves it here too on the next sync.
+  (Apple Reminders doesn't expose a reliable manual order through its API, so
+  it stays in creation-date order instead -- a new task, handwritten or
+  lassoed, always lands at the bottom.)
 - **See what a sync is doing** -- tapping the on-page SYNC button shows a small
   floating status bubble ("Reading the page…", "Saving…") so the device doesn't
   just look frozen while it works. It's non-interactive, so you can keep
@@ -81,17 +81,60 @@ share an identical API, so the plugin doesn't know or care which is running.
 |---|---|---|---|---|
 | Task source | Apple Reminders (EventKit) | Google Tasks | Todoist | TickTick |
 | Runs on | a Mac (only), auto-starts at login | any always-on host -- VPS, Mac, PC, Pi, laptop | **nothing to run** -- see below | any always-on host -- VPS, Mac, PC, Pi, laptop |
-| Setup | `./setup.sh`, one Reminders permission click | Google Cloud OAuth client + one `authorize` run | paste a personal API token into the plugin | TickTick OAuth client + one `authorize` run |
+| Setup | `./setup.sh`, one Reminders permission click | Google Cloud OAuth client + one `authorize` run | get a personal API token into the plugin | TickTick OAuth client + one `authorize` run |
 | Availability | needs the Mac awake and on the same Wi-Fi | can be always-on, reachable from anywhere you allow | works anywhere with internet | can be always-on, reachable from anywhere you allow |
 
-**Todoist is a special case: no server needed at all.** Paste a personal API
-token directly into the plugin's Sync Settings. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac or PC; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
+**Todoist is a special case: no server needed at all.** A personal API token
+goes straight into the plugin's Sync Settings. Note that the settings fields
+cannot paste, so see [the plugin README](plugin/README.md#direct-todoist-mode----getting-a-long-token-onto-the-tablet)
+for the ways that actually get a 40-character token in. Ink2Task needs a Todoist API token to connect to your account. You can find your token at [todoist.com/app/settings/integrations/developer](https://app.todoist.com/app/settings/integrations/developer) (copy the "API token"). You don't need an always-on Mac or PC; instead, this talks to Todoist's cloud straight from the tablet. [`todoist-server`](todoist-server/README.md) still exists as an
 optional standalone service if you'd rather keep the token off the tablet
 entirely, but most people won't need it.
 
 Data model differences worth knowing: Apple Reminders, Todoist, and TickTick
 all support priority and a due **time**, not just a date; Google Tasks has no
-priority concept and due dates are date-only.
+priority concept and due dates are date-only. **Subtasks** (shown on the page
+with a bold `>`, and creatable by writing `>` in front of a task) work on
+Todoist, Google Tasks, and TickTick; Apple Reminders cannot do them at all,
+because EventKit exposes no subtask API. Google Tasks allows exactly one level
+of nesting, Todoist allows several.
+
+### Deploying a server, per backend
+
+Every server is deployed the same way: get its credentials, install, authorize
+once, then leave it running. Pick your row and follow that README, which has
+the full walkthrough including the always-on options (pm2, systemd, a macOS
+LaunchAgent, or Windows).
+
+Open a terminal first. On Mac that is the **Terminal** app (Spotlight search,
+or Applications > Utilities > Terminal); on Windows press Start and type
+**PowerShell**. Then `git clone` this repo and `cd` into it.
+
+| Backend | What you need first | Then run | Default port |
+|---|---|---|---|
+| **Todoist** (easiest) | a personal API token | nothing, the token goes into the plugin | none |
+| [Apple Reminders](mac-server/README.md) | a Mac, Xcode command line tools | `cd mac-server && ./setup.sh` | 8942 |
+| [Google Tasks](google-tasks-server/README.md) | a Google Cloud OAuth client | `cd google-tasks-server && npm install && npm run authorize && npm start` | 8942 |
+| [TickTick](ticktick-server/README.md) | a TickTick OAuth client | `cd ticktick-server && npm install && npm run authorize && npm start` | 8955 |
+| [Todoist server](todoist-server/README.md) (optional) | a personal API token | `cd todoist-server && npm install && npm start` | 8942 |
+
+`setup.sh` is Apple-only and does everything at once: builds, installs a
+login-time service, asks which Reminders list to use, and prints the address to
+type into the plugin.
+
+Each server prints its own LAN address when it starts, for example
+`Listening on http://10.0.0.3:8955`. Put that host and port into the plugin's
+Sync Settings, then tap **Test my setup** to confirm the two halves agree
+before syncing anything real.
+
+**If you run more than one server, change the ports.** Apple, Google Tasks, and
+the optional Todoist server all default to **8942**, so starting a second one
+without editing its `config.json` will fail to bind, or worse, leave the plugin
+talking to whichever grabbed the port first. Only TickTick differs out of the
+box, at 8955. Set a distinct `port` in each server's `config.json` and restart
+it. Running several is otherwise fine and is what makes
+[Multiple lists on one note](#multiple-lists-on-one-note) work, with different
+pages syncing to different backends.
 
 ## Install
 
@@ -118,8 +161,8 @@ on-device: **Settings > Apps > Plugins > Install**. The plugin writes its own
 page template on first use -- nothing else to copy over.
 
 **3. Connect it.** Open any note, tap the **Ink2Task** icon, open **Settings**,
-and either enter the host/port your server printed, or (Todoist) paste your
-token. Choose the list to sync. Tap **Sync tasks**.
+and either enter the host/port your server printed, or (Todoist) enter your
+token (the field cannot paste -- see the plugin README for the easy routes). Choose the list to sync. Tap **Sync tasks**.
 
 ### Good to know
 
@@ -129,6 +172,57 @@ token. Choose the list to sync. Tap **Sync tasks**.
   such requirement.
 - **No authentication** between the plugin and a LAN server -- built for a
   trusted home network. Don't expose those ports to the internet.
+
+## Updating
+
+Ink2Task has two halves that update **separately**: the plugin on the tablet,
+and the backend server on your computer. Neither updates itself, and neither
+notices when the other is out of date, so a feature that needs both can look
+broken when it is only half-installed. Update both when a release mentions
+server changes.
+
+**1. Update the plugin.** Download the new `Ink2Task.snplg` from the
+[latest release](../../releases) and copy it to `MyStyle/` as during install.
+Then on-device: **Settings > Apps > Plugins**, **remove Ink2Task first**, then
+**Install**. The remove step is required every time -- the plugin host keeps an
+unpacked copy, so installing over the top can leave the old code running. Your
+settings, list bindings, and existing pages are kept.
+
+**2. Update the server** (skip if you use Todoist without a server). Open a
+terminal in the folder you cloned, then:
+
+```bash
+git pull
+```
+
+On Mac, open the **Terminal** app (Spotlight search, or Applications >
+Utilities > Terminal). On Windows, press Start and type **PowerShell**. Then
+`cd` into the folder you cloned before running the command above.
+
+For the Node servers (Todoist, Google Tasks, TickTick), install any new
+dependencies and restart:
+
+```bash
+npm install
+```
+
+Then stop the running server with **Ctrl+C** and start it again with
+`npm start`. If you set it up as an always-on service, restart that instead:
+`pm2 restart ink2task-<backend>`, or `sudo systemctl restart <service>` on
+Linux, or for a macOS LaunchAgent
+`launchctl kickstart -k gui/$(id -u)/com.ink2task.<backend>`.
+
+For the Apple Reminders server, rebuild it and restart the service:
+
+```bash
+cd mac-server && ./setup.sh
+```
+
+**3. Check the two halves agree.** In the plugin, open **Settings** and tap
+**Test my setup**. If your server is older than your plugin, the result says so
+in plain language and names what is missing. Everything that worked before
+keeps working either way -- an out-of-date server loses newer display details,
+not syncing.
 
 ## Usage
 

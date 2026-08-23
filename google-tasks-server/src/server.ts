@@ -159,6 +159,9 @@ async function main(): Promise<void> {
           app: 'ink2task',
           backend: 'google',
           listName: config.listName,
+          // See the note on this key in todoist-server. Google Tasks supports
+          // exactly one level of nesting via Schema$Task.parent.
+          features: ['subtasks'],
         });
       }
 
@@ -189,7 +192,9 @@ async function main(): Promise<void> {
         const due = typeof body.due === 'string' ? body.due : undefined;
         const tasks = tasksClient(config);
         const listId = await findListId(tasks, listName);
-        const created = await createTask(tasks, listId, title, due);
+        const parentId = typeof body.parentId === 'string' ? body.parentId : undefined;
+        const atStart = body.position === 'start';
+        const created = await createTask(tasks, listId, title, due, parentId, atStart);
         return sendJson(res, 200, created);
       }
 

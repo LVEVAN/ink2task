@@ -13,6 +13,11 @@ export type RemoteTask = {
   title: string;
   /** "YYYY-MM-DD", or omitted. Google Tasks dues are date-only (no time). */
   due?: string;
+  /**
+   * Parent task id when this is a subtask; omitted for top-level tasks. Google
+   * Tasks allows exactly one level of nesting (`Schema$Task.parent`).
+   */
+  parentId?: string;
 };
 
 export class ListNotFoundError extends Error {
@@ -100,6 +105,16 @@ export async function listIncompleteTasks(
       };
       // task.due is RFC3339 but Google Tasks only honors the date part.
       if (task.due) out.due = task.due.slice(0, 10);
+      // Subtasks are returned flat alongside their parents, so pass the link
+      // through for the page to mark.
+      //
+      // NOTE the `position` sort above does NOT put children under their
+      // parents: Google scopes a child's position to its parent's own children,
+      // so comparing the strings across a flat list scatters them (verified
+      // 2026-08-22 -- a child sorted to row 1 with its parent at row 6). The
+      // plugin reorders hierarchically after fetching, for every backend, since
+      // Todoist has the same behaviour. See orderByHierarchy.
+      if (task.parent) out.parentId = task.parent;
       return out;
     });
 }
@@ -135,44 +150,87 @@ export async function uncompleteTask(
 /**
  * Creates a task from captured text; returns its id and stored title.
  *
- * Google Tasks inserts at the TOP of the list unless `previous` names the task
- * to sit after, so we look up the current last task and insert after it. That
- * keeps the device's row order (oldest at top, new work appended) matching what
- * Google shows.
+ * Google Tasks inserts FIRST unless `previous` names the sibling to sit after.
+ * So "end" looks up the current last sibling and inserts after it, and "start"
+ * omits `previous`. For a subtask the sibling set is the parent's children, not
+ * the top level -- see the plugin's newTaskPosition.
  */
 export async function createTask(
   tasks: tasks_v1.Tasks,
   listId: string,
   title: string,
   due?: string,
+  /**
+   * Creates it as a subtask of this task id. Google Tasks allows exactly ONE
+   * level of nesting, so passing a parent that is itself a subtask is rejected
+   * by the API; the caller is responsible for not doing that.
+   */
+  parentId?: string,
+  /** Put it at the TOP of the list instead of appending. */
+  atStart?: boolean,
 ): Promise<{id: string; title: string}> {
   const requestBody: Record<string, string> = {title};
   if (due) requestBody.due = new Date(due + 'T00:00:00Z').toISOString();
-  const res = await tasks.tasks.insert({
-    tasklist: listId,
-    previous: await lastTopLevelTaskId(tasks, listId),
-    requestBody,
-  });
+  // `parent` and `previous` are insert PARAMETERS, not body fields.
+  // `previous` names the sibling to insert AFTER, so omitting it means "first".
+  //
+  // That is why a subtask used to land at the TOP of its parent's children
+  // (device 2026-08-22: "Bacon" became the first child, not the last): passing
+  // `parent` alone omits `previous`. Appending needs BOTH -- the parent, and
+  // that parent's current last child.
+  const parentParam = parentId ? {parent: parentId} : {};
+  const previous = atStart ? undefined : await lastSiblingTaskId(tasks, listId, parentId);
+
+  let res;
+  try {
+    res = await tasks.tasks.insert({
+      tasklist: listId,
+      ...parentParam,
+      ...(previous ? {previous} : {}),
+      requestBody,
+    });
+  } catch (err) {
+    // "Previous task id not found" (device 2026-08-22, on a handwritten "> Eggs").
+    // `previous` has to name a sibling Google will accept as a position anchor,
+    // and a completed or hidden one is not always addressable. Losing the task
+    // over its POSITION is the worst outcome here -- the page redraw has already
+    // erased the handwriting -- so fall back to inserting without a position.
+    const msg = (err as Error)?.message ?? '';
+    if (!previous || !/previous task/i.test(msg)) throw err;
+    console.error(`Insert with previous=${previous} failed (${msg}); retrying unpositioned`);
+    res = await tasks.tasks.insert({
+      tasklist: listId,
+      ...parentParam,
+      requestBody,
+    });
+  }
   if (!res.data.id) throw new Error('Google Tasks did not return a task id');
   return {id: res.data.id, title: res.data.title ?? title};
 }
 
 /**
- * Id of the last top-level task in the list's manual order, or undefined for an
- * empty list. Completed and hidden tasks count: they still hold a position, so
- * skipping them would drop the new task above them.
+ * Id of the LAST sibling under `parentId`, or the last top-level task when
+ * `parentId` is undefined. Undefined when there are no siblings yet, which
+ * correctly makes the new task the first one.
+ *
+ * Only VISIBLE (not completed, not hidden) siblings are considered. Completed
+ * tasks do still hold a position, which is why this used to include them, but
+ * Google rejects a completed task as a `previous` anchor with "Previous task id
+ * not found" -- and a task that fails to be created is far worse than one
+ * positioned slightly early.
  */
-async function lastTopLevelTaskId(
+async function lastSiblingTaskId(
   tasks: tasks_v1.Tasks,
   listId: string,
+  parentId?: string,
 ): Promise<string | undefined> {
   const items: tasks_v1.Schema$Task[] = [];
   let pageToken: string | undefined;
   do {
     const res = await tasks.tasks.list({
       tasklist: listId,
-      showCompleted: true,
-      showHidden: true,
+      showCompleted: false,
+      showHidden: false,
       maxResults: 100,
       pageToken,
     });
@@ -180,10 +238,10 @@ async function lastTopLevelTaskId(
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
 
-  const topLevel = items
-    .filter(t => t.id && !t.parent)
+  const siblings = items
+    .filter(t => t.id && (parentId ? t.parent === parentId : !t.parent))
     .sort((a, b) => (a.position ?? '').localeCompare(b.position ?? ''));
-  return topLevel[topLevel.length - 1]?.id ?? undefined;
+  return siblings[siblings.length - 1]?.id ?? undefined;
 }
 
 /** Sets or clears the due date on an existing task. */

@@ -215,6 +215,25 @@ function splitTrailingDue(text: string): {title: string; due: string | null} {
       return {title: words.slice(0, words.length - take).join(' '), due: iso};
     }
   }
+
+  // Handwriting recognition often runs the date into the word before it, with
+  // no space -- device-reported 2026-08-21, where "Test task date 8/29" came
+  // back as "Test task date8/29" and the loop above never saw "8/29" as a word
+  // of its own. So fall back to peeling a date off the raw tail.
+  //
+  // Deliberately narrow: the tail must carry a date SEPARATOR, so a task that
+  // merely ends in a number ("Order 4") can't be mistaken for one. Month names
+  // are NOT matched here on purpose -- unlike the whitespace path, a glued
+  // match can start mid-word, and "Decide 5" ends with a run that looks like
+  // "dec" + a day. A written-out month still works when it's spaced normally.
+  const glued = /(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)$/.exec(text);
+  if (glued) {
+    const iso = parseDueDate(glued[1]);
+    const title = text.slice(0, glued.index).trim();
+    // Same rule as above: never leave the task untitled.
+    if (iso && title) return {title, due: iso};
+  }
+
   return {title: text, due: null};
 }
 

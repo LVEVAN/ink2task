@@ -42,42 +42,43 @@ covers plugin-specific build/setup details.
 ## Direct Todoist mode -- getting a long token onto the tablet
 
 The Todoist profile talks straight to Todoist's cloud (no companion server),
-so you paste a **personal API token** into its settings field (Todoist ->
+so you need a **personal API token** in its settings field (Todoist ->
 Settings -> Integrations -> Developer). That token is ~40 characters, and
-typing it on an e-ink keyboard is miserable. Better ways:
+typing it on an e-ink keyboard is miserable.
 
-1. **Keyboard Sharing via the Supernote Partner app (recommended).** The
-   desktop Supernote Partner app can pair your computer's keyboard with the
-   tablet -- click the **keyboard icon** in the app (it opens **"Supernote
-   Linking"**). Once linked you can type into the token field with your
-   computer keyboard, and it also **bridges copy/paste** between the two: copy
-   the token on your computer, tap the token field on the tablet, and paste.
-   No third-party tools needed.
+> **Copy/paste does not work in this field, and neither does the Partner
+> app's keyboard sharing.** Both device-reported 2026-08-23. The field lives
+> inside the Supernote plugin host, which the system paste action and the
+> shared-keyboard input never reach. Only a **real keyboard the tablet is
+> paired with** types into it, or skip the field entirely (option 1).
 
-2. **Copy it from a PDF or document.** Current Supernote firmware supports
-   selecting and copying text (the text-selection pen) in **PDF, EPUB, CBZ,
-   FB2, and XPS** files. Put the token in one, open it on the tablet, select
-   and copy it, then paste it into the token field. (Older firmware without
-   text selection can't do this -- update first, or use another option.)
+Two things actually work:
 
-3. **Edit the config file directly -- no typing at all.** The plugin keeps its
-   settings in `MyStyle/Ink2Task/config.json` on the tablet. Open the plugin
-   once (so the file exists), then get that file onto a computer -- via the
-   Supernote's **Browse and Access** web page (Settings -> Browse and Access,
-   open the shown `http://...` URL in a browser) or over USB -- and edit it
-   where copy/paste is easy. Find the profile whose `"backend"` is
-   `"todoist"` and add your token:
+1. **Edit the config file directly -- no typing at all. Most reliable.** The
+   plugin keeps its settings in `MyStyle/Ink2Task/config.json` on the tablet.
+   Open the plugin once (so the file exists), then get that file onto a
+   computer -- via the Supernote's **Browse and Access** web page (Settings ->
+   Browse and Access, open the shown `http://...` URL in a browser) or over
+   USB -- and edit it there, where copy/paste is easy. Find the profile whose
+   `"backend"` is `"todoist"` and put your token in:
 
    ```json
    { "label": "Todoist", "backend": "todoist", "host": "", "port": 8944,
-     "listName": "Inbox", "token": "PASTE-YOUR-TOKEN-HERE" }
+     "listName": "Inbox", "token": "YOUR-TOKEN-HERE" }
    ```
 
    Save it back to `MyStyle/Ink2Task/config.json` and reopen the plugin. Edit
-   it while the plugin view is **closed** so it doesn't overwrite your change.
+   it while the plugin view is **closed**, or it will overwrite your change.
 
-4. **Plug in a USB-C keyboard** and type the token into the field (a
-   text-expander macro that emits the stored token makes it one keystroke).
+2. **Pair a Bluetooth keyboard** (or plug in a USB-C one) and type the token
+   into the field. A text-expander macro that emits the stored token makes it
+   one keystroke. Typing it by hand on the on-screen keyboard also works, it is
+   just slow and easy to get wrong -- check the end of it especially.
+
+Things that do NOT work, so you don't lose time on them: pasting into the
+field, the Partner app's keyboard sharing, and copying the token out of a PDF
+to paste in. Reading the token off a large-font PDF while you type is still a
+reasonable trick.
 
 ## Notes on the implementation
 

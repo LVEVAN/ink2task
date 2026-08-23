@@ -325,8 +325,41 @@ export type TickTickTaskRaw = {
   timeZone?: string; // IANA zone, e.g. "America/Los_Angeles"
   priority?: number; // 0 | 1 | 3 | 5
   status?: number; // 0 = active, 2 = completed (corroborated by multiple third-party integrations, not seen first-party)
-  /** Present on GET responses; used as our change-detection signal since
-   * TickTick tasks carry no documented modified/updated timestamp. */
+  /**
+   * Present on GET responses; our change-detection signal.
+   *
+   * Correction (2026-08-21): an earlier version of this comment claimed
+   * TickTick carries no modified/updated timestamp at all. That was wrong.
+   * A live read-only probe of GET /project/{id}/data against a real account
+   * returned both `modifiedTime` and `createdTime` on 7 of 7 tasks
+   * (undocumented in Open API v1, but consistently present).
+   *
+   * We still key on `etag`, deliberately:
+   *   - The only question the sync engine asks today is "has the remote moved
+   *     since we last looked," which is exactly an opaque-token equality
+   *     compare. An etag mismatch means *something* changed; no clock, no
+   *     granularity, no timezone parsing, no skew between this server and
+   *     TickTick's.
+   *   - `etag` is device-verified to change on every mutation (2026-08-11).
+   *     `modifiedTime`'s update guarantees are unverified: we do not know
+   *     which mutations bump it, at what granularity, or whether two edits
+   *     inside one tick are distinguishable. Equality on an unverified
+   *     timestamp is a weaker signal than equality on a verified etag.
+   *
+   * `modifiedTime` is genuinely complementary, not a replacement: it is the
+   * only field that could ORDER two competing edits, which an opaque etag
+   * can never do. It is what a real last-write-wins policy would need. We
+   * have no last-write-wins policy today (conflicts resolve remote-wins,
+   * see decideDueSync in the plugin's ticktickSync.ts), so nothing reads it
+   * yet and it is intentionally left unmodelled here rather than carried as
+   * a field with no consumer. Model it if and when the conflict policy
+   * changes; the plumbing is TickTickTaskRaw -> RemoteTask -> toWireReminder
+   * (server.ts) -> TickTickSyncRecord (plugin's config.ts).
+   *
+   * Other fields observed in the same live response and likewise unmodelled:
+   * childIds, columnId, columnName, createdTime, etimestamp, isFloating,
+   * items, kind, progress, startDate, tags.
+   */
   etag?: string;
   /**
    * TickTick's manual ordering position within a project -- a signed integer,
@@ -336,6 +369,25 @@ export type TickTickTaskRaw = {
    * by it explicitly below.
    */
   sortOrder?: number;
+  /**
+   * Parent task's id, set only on subtasks. Undocumented in every third-party
+   * transcription of the Open API v1 Task object, but VERIFIED live against a
+   * real account 2026-08-21 via GET /project/{id}/data: a subtask carried
+   * `parentId` pointing at its parent, and the parent carried the reciprocal
+   * `childIds: [...]`. The two agreed exactly, so the link is trustworthy in
+   * both directions (we only need this one).
+   *
+   * Only present on tasks that have a parent -- it is absent, not null, on
+   * top-level tasks, hence the `?? undefined` in mapTask.
+   *
+   * Note: distinct from TickTick's `items[]`, which is a checklist *inside* a
+   * single task. Same live response had one task carrying both a real subtask
+   * and an `items[]` entry, which is exactly why they can't be conflated:
+   * checklist items have no task ids of their own, can't be completed through
+   * the task endpoints, and deliberately stay unmodelled. See the scope note
+   * in the plugin's ticktickSync.ts.
+   */
+  parentId?: string | null;
 };
 
 export type TickTickProjectData = {
@@ -368,6 +420,9 @@ export type RemoteTask = {
   /** See TickTickTaskRaw.sortOrder. Sorted on already by listProjectTasks --
    * kept here mainly so callers/tests can assert on it. */
   sortOrder?: number;
+  /** Parent task id when this is a subtask. See TickTickTaskRaw.parentId --
+   * may never be populated, since the field is unverified on this API. */
+  parentId?: string;
 };
 
 /** TickTick raw priority (0/1/3/5) -> the plugin's 1-4 scale, or undefined for "None". */
@@ -446,6 +501,7 @@ export function mapTask(raw: TickTickTaskRaw): RemoteTask {
     completed: raw.status === 2,
     etag: raw.etag,
     sortOrder: raw.sortOrder,
+    parentId: raw.parentId ?? undefined,
   };
 }
 
@@ -520,6 +576,24 @@ export type CreateTaskInput = {
   notes?: string;
   due?: string;
   priority?: 1 | 2 | 3 | 4;
+  /**
+   * Creates it as a subtask of this task id. Sent as `parentId`, the same
+   * undocumented-but-live-verified field the read path uses (see
+   * TickTickTaskRaw.parentId). Untested on the WRITE path: TickTick's create
+   * endpoint is not documented as accepting it, so if it is ignored the task
+   * is still created, just at the top level.
+   */
+  parentId?: string;
+  /**
+   * Put it at the TOP of the list. Sent as a large negative `sortOrder`, since
+   * listProjectTasks sorts ascending by that field.
+   *
+   * ⚠ UNVERIFIED on the WRITE path: `sortOrder` is confirmed on READ (it is what
+   * matches the TickTick app's manual order) but the create endpoint is not
+   * documented as accepting it. If ignored, the task is still created, just at
+   * the backend's default position.
+   */
+  atStart?: boolean;
 };
 
 export async function createTask(
@@ -533,6 +607,8 @@ export async function createTask(
   if (input.notes) body.content = input.notes;
   if (input.priority !== undefined) body.priority = priorityToTickTick(input.priority);
   if (input.due) Object.assign(body, dueToTickTick(input.due));
+  if (input.parentId) body.parentId = input.parentId;
+  if (input.atStart) body.sortOrder = -(2 ** 42);
 
   const {res, config: next} = await ticktickFetch(config, '/task', {
     method: 'POST',

@@ -18,7 +18,7 @@ import {PluginManager, NativeUIUtils, PluginCommAPI} from 'sn-plugin-lib';
 import {loadConfig} from './src/utils/config';
 import {toAbsolute} from './src/utils/notePicker';
 import {overlayShow, overlayUpdate, overlayHide} from './src/utils/overlay';
-import {syncThenFetch, formatSyncSummary} from './src/actions';
+import {syncThenFetch, formatSyncSummary, explainSyncFailure} from './src/actions';
 import {addLassoedTaskToInk2Task} from './src/utils/lassoCapture';
 import {unwrap, withTimeout, friendlyErrorMessage} from './src/utils/sdk';
 import {acquireBusy, releaseBusy} from './src/utils/busy';
@@ -231,6 +231,8 @@ PluginManager.registerMotionListener(1, {
           r.completedTitles || [],
           r.warnings || [],
           r.duesSet || [],
+          r.pageOffer,
+          r.pagesReclaimed || 0,
         );
         try {
           NativeUIUtils.showRattaDialog(
@@ -242,7 +244,14 @@ PluginManager.registerMotionListener(1, {
         } catch (_) {}
       } catch (err) {
         const raw = err && err.message ? err.message : 'sync failed';
-        const msg = friendlyErrorMessage(raw);
+        // Say WHY. The on-page button is often the only surface a user sees, so
+        // a bare "network request failed" here is what the removed "TEST MY
+        // SETUP" button used to exist to unpack. Falls back to the plain message
+        // if the diagnosis itself cannot run.
+        let msg = friendlyErrorMessage(raw);
+        try {
+          msg = await explainSyncFailure(config, err);
+        } catch (_) {}
         try {
           NativeUIUtils.showRattaDialog('Ink2Task: ' + capFirst(msg), 'OK', '', false);
         } catch (_) {}
@@ -348,6 +357,8 @@ PluginManager.registerButtonListener({
           r.completedTitles || [],
           r.warnings || [],
           r.duesSet || [],
+          r.pageOffer,
+          r.pagesReclaimed || 0,
         );
       } catch (e) {
         summary += '\n\n⚠ Added, but the checklist redraw failed: ' + (e && e.message ? e.message : 'unknown error');

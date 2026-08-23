@@ -48,6 +48,39 @@ swift build -c release
 Useful for development/debugging. Logs go to stdout instead of
 `~/.ink2task/server.log`.
 
+## Updating
+
+This server and the tablet plugin update **separately**, and neither notices
+when the other is out of date. When a release changes both, update both.
+
+Open the **Terminal** app (Spotlight search, or Applications > Utilities >
+Terminal), `cd` into the folder you cloned, then:
+
+```bash
+git pull
+```
+
+```bash
+cd mac-server && ./setup.sh
+```
+
+`setup.sh` rebuilds the binary, refreshes the copy the LaunchAgent runs from,
+and restarts the service. Running it again on an existing install is safe.
+
+Rebuilding alone is **not** enough: the LaunchAgent runs a copy at
+`~/.ink2task/Ink2TaskServer`, not the binary in `.build/release`, so a fresh
+build that is never copied across changes nothing. If you build by hand instead
+of using `setup.sh`, copy it over and restart:
+
+```bash
+cp .build/release/Ink2TaskServer ~/.ink2task/ && launchctl kickstart -k gui/$(id -u)/com.ink2task.server
+```
+
+Note that subtask markers are **not available on Apple Reminders** at any
+version. EventKit exposes no subtask API, so this is a permanent limitation of
+the backend rather than something a server update fixes. The plugin knows this
+and will not tell you to update your server over it.
+
 ## Config file
 
 `~/.ink2task/config.json`:
