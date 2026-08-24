@@ -16,7 +16,9 @@ description: "Build, debug, and extend Supernote e-ink device plugins using the 
 ## ⚠️ INK2TASK LOCAL CORRECTIONS — read before following this file
 
 This skill was written for a different plugin. Some of it is wrong for this
-codebase, all verified on our own A5X hardware:
+codebase, and the rest is what we learned the hard way. Everything here was
+verified on our own hardware — items 1-5 on an A5X, items 6-15 on a Manta
+(added 2026-08-23), which is where the device-specific ones matter.
 
 1. **Gotcha #9 says call `saveCurrentNote()` BEFORE `insertElements` /
    `replaceElements`. DO NOT DO THIS on our redraw path.** Committing the
@@ -71,6 +73,112 @@ codebase, all verified on our own A5X hardware:
    independently at each one — see `syncThenFetch`'s `target` option and its
    doc comment in `plugin/src/actions.ts` for the pattern that fixed exactly
    this in our lasso-capture-then-redraw flow.
+
+6. **The whole `AndroidManifest.xml` in `plugin/android/` is INERT.** This APK
+   is never installed as an app — `app.npk` is unpacked inside
+   `com.ratta.supernote.pluginhost` and runs under the HOST's manifest. So a
+   permission or a `usesCleartextTraffic` flag added to our manifest changes
+   nothing at runtime. Whatever the host declares is what you get. This is easy
+   to lose days to, because the manifest edit looks like it should work.
+
+7. **Plain `http://` is BLOCKED in the plugin host on newer firmware, and the
+   failure is disguised.** `NetworkSecurityPolicy.isCleartextTrafficPermitted()`
+   returns false (the host targets SDK 35 and declares neither
+   `usesCleartextTraffic` nor a `networkSecurityConfig`), so every `fetch` to a
+   LAN address fails instantly with React Native's generic
+   `Network request failed`. Device-confirmed on a Manta 2026-08-23: 1016
+   discovery probes completed in 2.8 seconds without a packet leaving the
+   device, including one aimed at a server that answered a raw socket from that
+   same tablet. It reads exactly like "no server on the network". An A5X on
+   Android 8.1 never hit this, and other Mantas connect fine, so it tracks the
+   plugin-host version rather than the model.
+
+   **Workaround:** the policy governs the platform HTTP stacks, not
+   `java.net.Socket`. `Ink2TaskNetModule.httpRequest` speaks HTTP/1.0 with
+   `Connection: close` (body ends at EOF, so there is no chunked parsing) on its
+   own thread; `plugin/src/utils/lanHttp.ts` wraps it as `lanFetch` with a
+   fetch-shaped result and falls back to real `fetch` for https, when cleartext
+   IS permitted, and when the native module is missing. Check the policy before
+   blaming the network — and note that once probes are real, a dead address
+   costs a full timeout, so any concurrency figure tuned against instant
+   failures is fiction.
+
+8. **`/proc/net/route` is unreadable from Android 11 on, so there is no
+   JS-only way to learn the tablet's own IP.** Needed for any subnet sweep.
+   `Ink2TaskNetModule.getLocalIpv4()` tries three sources in order:
+   `NetworkInterface` (no permission needed AND it carries the prefix length —
+   preferred), `ConnectivityManager` LinkProperties, then the deprecated
+   `WifiManager.getConnectionInfo().getIpAddress()` (IPv4 only, no mask, assumes
+   /24, and note the value is little-endian). Permissions come from the host
+   (correction #6), which already holds `ACCESS_WIFI_STATE` and
+   `ACCESS_NETWORK_STATE`.
+
+9. **Manta device detection: trust `PluginManager.getDeviceType()`, not the
+   model string, and never trust `Dimensions` for pixels.** A Manta reports
+   `ro.product.model = "Supernote Nomad"` while carrying a 1920x2560 panel;
+   `getDeviceType()` correctly returns **5** (A5X = 3, Nomad = 4). Separately,
+   React Native's `Dimensions` returns **DP, not pixels** — a Manta reads
+   1024x1365.33 at a `PixelRatio.get()` of 1.875 — so any size comparison
+   against a panel constant must multiply by the pixel ratio first. Ours did
+   not, which made a whole fallback branch dead code. See
+   `plugin/src/utils/deviceSize.ts`.
+
+10. **`recognizeElements` has a positional dead zone on the last row of a
+    page.** It failed with code 117 on the bottom capture box while an
+    identically-built box in the middle of the page succeeded — same stroke
+    count, correct rect, ink verifiably inside it, correct `pageSize`. Padding
+    the rect, retrying, and splitting the strokes all failed to fix it. What
+    works is retrying against a **larger** supported canvas
+    (`alternatePageSize`). Only ever go larger: dropping to a smaller canvas
+    puts the ink outside it and guarantees failure, which is what our first
+    version of this did on the Manta. See `recognizeResilient` in
+    `plugin/src/utils/capture.ts`.
+
+11. **Drawing facts worth knowing, from the community's `.note` format
+    reverse-engineering** (`plugin/assets/vector-format-spec.md`, cross-checked
+    against Supernote's own PDF exports):
+    - `penWidth` / `thickness` is **hundredths of a page pixel**. `penWidth: 100`
+      is a 1px line. `penType: 10` (needle) renders at 0.94–1.04x its nominal
+      width, so it is the pen to use when the width has to be exact.
+    - `penColor: 254` is **white, and white always wins** — it covers darker ink
+      regardless of draw order. That makes thick white strokes a plausible
+      cover-up for ink you could not erase.
+    - Do NOT reach for a filled rectangle to cover something. A filled rect is a
+      2-point stroke record whose `pen`/`color`/`thickness` fields are
+      meaningless; the real fill colour lives in `TITLE_` footer metadata that
+      the SDK cannot write. Thick strokes are the route.
+
+12. **`insertNotePage` / `getPageSize` / page-count traps on multi-page notes.**
+    `insertNotePage` requires a non-empty template argument. `getPageSize` fails
+    with **1207** on a page that does not exist, which aborts a sync — so clamp
+    any page index you kept in your own state against the note's real page
+    count, since the user can delete pages between your calculation and your
+    draw. And do not infer "this is the template page" from
+    `getNoteTotalPageNum() === 1`: that heuristic inverts on a 3-page note and
+    draws a second SYNC button over the baked-in one.
+
+13. **`replaceElements` wipes the entire page, so ALL reads must precede ALL
+    writes** when you touch more than one page. Our `harvestPages` reads every
+    active page, then captures and completes each, before anything is redrawn.
+    Related: pages must be processed sequentially, not in parallel — each page
+    is its own whole-page mutation built from a shared native element cache, and
+    overlapping them risks interleaving two pages' batches.
+
+14. **The `.snplg` filename must equal `pluginKey` EXACTLY, or the device
+    refuses to install it.** Supernote's installer verifies the filename against
+    the package and rejects any renamed copy with *"Installation Failed. The
+    plugin might have been modified."* — even when the bytes are md5-identical
+    (a version-stamped `Ink2Task-0.2.50.snplg` failed; the byte-identical
+    `Ink2Task.snplg` installed fine). So ship the canonically-named file and put
+    the version in the release notes, not the filename. Also: a reinstall needs
+    a **remove first**, because the host caches an unpacked copy.
+
+15. **Jest cannot transform `sn-plugin-lib` or `react-native-fs` (ESM), so
+    anything you want unit tested must import NOTHING.** Our tested modules
+    (`taskText.ts`, `pagination.ts`, `deviceSize.ts`, `listMatch.ts`,
+    `serverFeatures.ts`) are deliberately import-free and hold the logic, while
+    the SDK-touching wrappers around them stay untested. Two suites that do
+    import the SDK have never run.
 
 Our own hard-won findings live in this project's Claude memory
 (`ink2task-sdk-gotchas`). Where that and this skill conflict, **the memory
