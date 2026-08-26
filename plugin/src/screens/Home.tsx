@@ -55,8 +55,11 @@ import {
   explainSyncFailure,
   recoverMissingList,
 } from '../actions';
-import {discoverServer} from '../utils/discover';
+import {discoverServer, lastDiscoveryReport} from '../utils/discover';
 import {unwrap, withTimeout, friendlyErrorMessage, isAuthFailure} from '../utils/sdk';
+import {ensurePermissions, ensureInternet, forgetPermission} from '../utils/permissions';
+import {diagnoseTransports} from '../utils/lanHttp';
+import {explainDenied, PERMISSIONS} from '../utils/permissionPolicy';
 import pluginConfig from '../../PluginConfig.json';
 
 // A curated set of readable device fonts (from /system/fonts). Not the full
@@ -80,6 +83,10 @@ export default function Home() {
   // Step 2 list picker: names loaded from the server, and whether it's open.
   const [listOptions, setListOptions] = useState<string[] | null>(null);
   const [listPickerOpen, setListPickerOpen] = useState(false);
+  /** Set when settings could not be read at all -- otherwise the spinner never ends. */
+  const [loadError, setLoadError] = useState('');
+  /** JSON of the last config written, so an unchanged config is never rewritten. */
+  const lastSavedRef = useRef<string>('');
   // Lets the sync retry itself once after a missing list is auto-corrected.
   // A ref, not a direct call: runFetchAndWrite cannot reference itself inside
   // its own useCallback. The retry passes isRetry, which is what caps it at ONE
@@ -88,6 +95,11 @@ export default function Home() {
   const runSyncRef = useRef<
     ((isRetry?: boolean, override?: Ink2TaskConfig) => Promise<void>) | null
   >(null);
+  // One collapse flag per framed section, all OPEN by default: the sections are
+  // there to group the page, not to hide it, and having to open two of three
+  // before you can see your settings is worse than a longer scroll.
+  const [tasksOpen, setTasksOpen] = useState(true);
+  const [formatOpen, setFormatOpen] = useState(true);
   // Whether the (large) Sync Settings section is expanded.
   const [syncOpen, setSyncOpen] = useState(true);
   // Lasso Capture Target picker: collapsed by default, like the list picker above.
@@ -119,11 +131,22 @@ export default function Home() {
 
   const [loaded, setLoaded] = useState(false);
   useEffect(() => {
-    loadConfig().then(c => {
-      setConfig(c);
-      setPortText(String(c.port));
-      setLoaded(true);
-    });
+    loadConfig()
+      .then(c => {
+        // Seed the "already saved" snapshot from what we just read, so the
+        // auto-save effect does not treat the loaded config as a change.
+        lastSavedRef.current = JSON.stringify(c);
+        setConfig(c);
+        setPortText(String(c.port));
+        setLoaded(true);
+      })
+      .catch((e: any) => {
+        // Without this the screen sits on its spinner forever with no way out.
+        // The realistic cause is file permission being declined at startup, so
+        // say that rather than showing nothing (2026-08-24).
+        console.log('[Ink2Task] loadConfig failed:', e?.message || e);
+        setLoadError(friendlyErrorMessage(e?.message || 'Could not read settings.'));
+      });
     loadTicktickSyncMeta().then(setTicktickMeta);
   }, []);
 
@@ -179,7 +202,20 @@ export default function Home() {
   // Auto-save: persist whenever settings change, so there's no "Save" button to
   // remember. Skips the initial load (nothing to write yet).
   useEffect(() => {
-    if (loaded && config) saveConfig(config);
+    if (!loaded || !config) return;
+    // Skip the write when nothing actually changed. This effect fires once as
+    // soon as loading finishes, so merely OPENING Settings used to rewrite the
+    // file unchanged -- which on the preview firmware meant a "modify files"
+    // permission dialog before the user had touched anything (2026-08-24).
+    const snapshot = JSON.stringify(config);
+    if (snapshot === lastSavedRef.current) return;
+    lastSavedRef.current = snapshot;
+    // Was fire-and-forget with no catch: a refused write (the preview
+    // firmware's file permission) failed silently, so a token could look
+    // typed in and never be stored.
+    saveConfig(config).catch((e: any) =>
+      console.log('[Ink2Task] settings save failed:', e?.message || e),
+    );
   }, [config, loaded]);
 
   // NOTE: lasso capture no longer runs here. It happens entirely in the
@@ -222,6 +258,13 @@ export default function Home() {
     // setButtonState) was either unsafe, too intrusive, or the wrong UI element.
     safeSetStatus({kind: 'busy', message: 'Reading the page…'});
     try {
+      // Permission gate, before any file or network work. No-ops on firmware
+      // without a permission system -- see utils/permissions.ts.
+      const perms = await ensurePermissions();
+      if (!perms.ok) {
+        safeSetStatus({kind: 'error', message: explainDenied(perms.denied)});
+        return;
+      }
       // Timeout-wrapped: resolveTarget calls getCurrentFilePath/getCurrentPageNum,
       // which have been observed to HANG (never resolve or reject) rather than
       // error when there's no active note editor -- e.g. this screen opened via
@@ -352,9 +395,25 @@ export default function Home() {
           completedTitles,
           warnings,
           duesSet,
+          // Every reason field, not just hidden/needed. This screen keeps its own
+          // copy of the sync pipeline, so when the reasons were added to the
+          // on-page path they were missing here -- and with them all undefined
+          // the message fell into whichever branch matches "nothing known",
+          // telling the user to turn on a setting that was already on
+          // (2026-08-25). Spread the result so a new field cannot be forgotten
+          // at one of the two call sites again.
           paged.overflow > 0 && paged.pagesNeeded > paged.usablePages
-            ? {hidden: paged.overflow, needed: paged.pagesNeeded}
+            ? {
+                hidden: paged.overflow,
+                needed: paged.pagesNeeded,
+                blockedByBinding: paged.blockedByBinding,
+                autoAddOn: paged.autoAddOn,
+                atPageLimit: paged.atPageLimit,
+                growFailed: paged.growFailed,
+              }
             : undefined,
+          paged.pagesReclaimed,
+          paged.skippedForeignPages,
         ),
       });
       // TickTick only: persist what Settings shows as "last sync" -- the one
@@ -436,15 +495,37 @@ export default function Home() {
   const runDiscover = useCallback(async () => {
     if (!config) return;
     const backend = config.profiles[config.activeProfile]?.backend;
+    // Ask for internet permission BEFORE the sweep starts, not from inside the
+    // first probe. Two reasons: a refusal here can be reported honestly instead
+    // of surfacing as "no matching server", and the dialog is not sitting on
+    // screen while 32 probes race their own timeouts. Granting it falls
+    // straight through into the search below -- no second tap.
+    setStatus({kind: 'busy', message: 'Checking permission…'});
+    const net = await ensureInternet();
+    if (!net.ok) {
+      // Let the next tap reach the host again, which is what produces the
+      // take-me-to-settings dialog. See forgetPermission.
+      forgetPermission(PERMISSIONS.INTERNET);
+      setStatus({kind: 'error', message: friendlyErrorMessage(net.message)});
+      return;
+    }
+    // TEMPORARY DIAGNOSTIC: when a host is already configured, test it by every
+    // transport before sweeping. Discovery on the preview firmware times out on
+    // every probe while the same tablet connects fine from an adb shell -- but
+    // that shell runs as another user, so it says nothing about this process.
+    // Remove once the beta's behaviour is understood.
+    if (config.host.trim()) {
+      await diagnoseTransports(config.host.trim(), config.port);
+    }
     setStatus({kind: 'busy', message: 'Searching this Wi-Fi for the server…'});
     try {
       const found = await discoverServer(config.port, backend, config.host);
       if (!found) {
-        setStatus({
-          kind: 'error',
-          message:
-            'No matching server found on this Wi-Fi. Check the server for this profile is running on the same network, or enter its IP and port manually.',
-        });
+        // Says what the sweep actually saw, not just that it failed. See
+        // lastDiscoveryReport -- "nothing running", "something running but for
+        // another service" and "could not reach the network" need different
+        // actions and used to read identically.
+        setStatus({kind: 'error', message: lastDiscoveryReport(backend)});
         return;
       }
       const next = setActiveConnection(config, {host: found.host, port: found.port});
@@ -530,7 +611,7 @@ export default function Home() {
   if (!config) {
     return (
       <View style={styles.container}>
-        <ActivityIndicator />
+        {loadError ? <Text style={styles.errorText}>{loadError}</Text> : <ActivityIndicator />}
       </View>
     );
   }
@@ -587,13 +668,13 @@ export default function Home() {
         )}
 
         <View style={styles.settingsBox}>
-            <Pressable style={styles.sectionHeaderRow} onPress={() => setSyncOpen(o => !o)}>
-              <Text style={styles.sectionLabel}>Sync Settings</Text>
-              <Text style={styles.collapseChevron}>{syncOpen ? '▾' : '▸'}</Text>
-            </Pressable>
-            {syncOpen && (
-            <View>
-              <Text style={styles.fieldLabel}>Which backend are you using?</Text>
+          <Pressable style={styles.sectionHeaderRow} onPress={() => setSyncOpen(o => !o)}>
+            <Text style={styles.collapseChevron}>{syncOpen ? '▼' : '▶'}</Text>
+            <Text style={styles.sectionLabel}>Sync Settings</Text>
+          </Pressable>
+          {syncOpen && (
+          <View style={styles.sectionBody}>
+              <Text style={styles.subSectionLabel}>CHOOSE A TASK APP TO SYNC</Text>
               <Text style={styles.toggleHint}>
               The highlighted one is active.
             </Text>
@@ -618,7 +699,7 @@ export default function Home() {
 
               {config.profiles[config.activeProfile]?.backend === 'todoist' ? (
                 <>
-                  <Text style={styles.stepLabel}>Step 1 · Enter your Todoist API token</Text>
+                  <Text style={styles.stepLabel}>Enter your Todoist API token</Text>
                   <Field
                     label="Todoist API token"
                     value={config.profiles[config.activeProfile]?.token || ''}
@@ -633,7 +714,7 @@ export default function Home() {
                   <Pressable style={styles.wideButton} onPress={runDiscover}>
                     <Text style={styles.wideButtonText}>FIND SERVER ON WI-FI</Text>
                   </Pressable>
-                  <Text style={styles.stepLabel}>Step 1 · Connect to the server</Text>
+                  <Text style={styles.stepLabel}>Connect to the server</Text>
                   {config.profiles[config.activeProfile]?.backend === 'ticktick' &&
                     // Only shown before a server address is set -- once FIND SERVER
                     // ON WI-FI (or typing one in below) succeeds, these setup
@@ -678,7 +759,7 @@ export default function Home() {
               )}
 
 
-              <Text style={styles.stepLabel}>Step 2 · Choose the list</Text>
+              <Text style={styles.stepLabel}>Choose the task list</Text>
               <Pressable style={styles.pickerButton} onPress={runChooseList}>
                 <Text style={styles.pickerButtonText}>
                   {config.listName ? config.listName : 'No list selected'}
@@ -705,7 +786,58 @@ export default function Home() {
                 </View>
               )}
 
-              <Text style={styles.stepLabel}>Step 4 · Add New Task Behavior</Text>
+              {config.profiles[config.activeProfile]?.backend === 'ticktick' && (
+                <>
+                  <Text style={styles.stepLabel}>Status</Text>
+                  <Text style={styles.toggleHint}>
+                    {ticktickMeta.lastSyncAt
+                      ? `Last synced ${new Date(ticktickMeta.lastSyncAt).toLocaleString()}`
+                      : 'Not synced yet -- tap "Sync tasks" above.'}
+                    {ticktickMeta.lastError ? `\n⚠ ${ticktickMeta.lastError}` : ''}
+                  </Text>
+                </>
+              )}
+          </View>
+          )}
+        </View>
+
+        <View style={styles.settingsBox}>
+          <Pressable style={styles.sectionHeaderRow} onPress={() => setTasksOpen(o => !o)}>
+            <Text style={styles.collapseChevron}>{tasksOpen ? '▼' : '▶'}</Text>
+            <Text style={styles.sectionLabel}>Task Settings</Text>
+          </Pressable>
+          {tasksOpen && (
+          <View style={styles.sectionBody}>
+              <Text style={styles.stepLabel}>Long lists</Text>
+              <View style={[styles.fontRow, {marginTop: 4}]}>
+                <Pressable
+                  style={[styles.fontChip, config.autoAddPages !== false && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, autoAddPages: true})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.autoAddPages !== false && styles.fontChipTextOn,
+                    ]}>
+                    Continue on more pages
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.fontChip, config.autoAddPages === false && styles.fontChipOn]}
+                  onPress={() => setConfig({...config, autoAddPages: false})}>
+                  <Text
+                    style={[
+                      styles.fontChipText,
+                      config.autoAddPages === false && styles.fontChipTextOn,
+                    ]}>
+                    One page only
+                  </Text>
+                </Pressable>
+              </View>
+              <Text style={styles.hint}>
+                A long list carries on to more pages, up to five. Every page keeps its last row free to write in.
+              </Text>
+
+              <Text style={styles.stepLabel}>Add New Task Behavior</Text>
               <View style={[styles.fontRow, {marginTop: 4}]}>
                 <Pressable
                   style={[styles.fontChip, config.newTaskPosition !== 'start' && styles.fontChipOn]}
@@ -734,50 +866,36 @@ export default function Home() {
                 Not available on Apple Reminders.
               </Text>
 
-              <Text style={styles.stepLabel}>Step 3 · Long lists</Text>
-              <View style={[styles.fontRow, {marginTop: 4}]}>
-                <Pressable
-                  style={[styles.fontChip, config.autoAddPages !== false && styles.fontChipOn]}
-                  onPress={() => setConfig({...config, autoAddPages: true})}>
-                  <Text
-                    style={[
-                      styles.fontChipText,
-                      config.autoAddPages !== false && styles.fontChipTextOn,
-                    ]}>
-                    Continue on more pages
-                  </Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.fontChip, config.autoAddPages === false && styles.fontChipOn]}
-                  onPress={() => setConfig({...config, autoAddPages: false})}>
-                  <Text
-                    style={[
-                      styles.fontChipText,
-                      config.autoAddPages === false && styles.fontChipTextOn,
-                    ]}>
-                    One page only
-                  </Text>
-                </Pressable>
-              </View>
-              <Text style={styles.hint}>
-                A long list carries on to pages 2 and 3. Every page keeps its last row free to write in.
-              </Text>
-
-              {config.profiles[config.activeProfile]?.backend === 'ticktick' && (
-                <>
-                  <Text style={styles.stepLabel}>Status</Text>
-                  <Text style={styles.toggleHint}>
-                    {ticktickMeta.lastSyncAt
-                      ? `Last synced ${new Date(ticktickMeta.lastSyncAt).toLocaleString()}`
-                      : 'Not synced yet -- tap "Sync tasks" above.'}
-                    {ticktickMeta.lastError ? `\n⚠ ${ticktickMeta.lastError}` : ''}
-                  </Text>
-                </>
-              )}
+            <Text style={styles.subSectionLabel}>On-page SYNC button</Text>
+            <View style={[styles.fontRow, {marginTop: 4}]}>
+              <Pressable
+                style={[styles.fontChip, config.onPageSyncEnabled !== false && styles.fontChipOn]}
+                onPress={() => setConfig({...config, onPageSyncEnabled: true})}>
+                <Text
+                  style={[
+                    styles.fontChipText,
+                    config.onPageSyncEnabled !== false && styles.fontChipTextOn,
+                  ]}>
+                  On
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[styles.fontChip, config.onPageSyncEnabled === false && styles.fontChipOn]}
+                onPress={() => setConfig({...config, onPageSyncEnabled: false})}>
+                <Text
+                  style={[
+                    styles.fontChipText,
+                    config.onPageSyncEnabled === false && styles.fontChipTextOn,
+                  ]}>
+                  Off
+                </Text>
+              </Pressable>
             </View>
-            )}
+            <Text style={styles.toggleHint}>
+              The SYNC button drawn on the page. Turn off if it fires by accident.
+            </Text>
 
-            <Text style={styles.sectionLabel}>Lasso Capture Target</Text>
+            <Text style={styles.subSectionLabel}>Lasso Capture Target</Text>
             <Text style={styles.toggleHint}>
               Where lasso captures from other notes land.
             </Text>
@@ -868,7 +986,18 @@ export default function Home() {
               );
             })()}
 
-            <Text style={styles.sectionLabel}>Text appearance</Text>
+          </View>
+          )}
+        </View>
+
+        <View style={styles.settingsBox}>
+          <Pressable style={styles.sectionHeaderRow} onPress={() => setFormatOpen(o => !o)}>
+            <Text style={styles.collapseChevron}>{formatOpen ? '▼' : '▶'}</Text>
+            <Text style={styles.sectionLabel}>Formatting</Text>
+          </Pressable>
+          {formatOpen && (
+          <View style={styles.sectionBody}>
+            <Text style={styles.subSectionLabel}>Text appearance</Text>
             <View style={styles.appearanceRow}>
               {FONTS.map(f => {
                 const selected = (config.fontPath || '') === f.path;
@@ -908,7 +1037,7 @@ export default function Home() {
               </View>
             </View>
 
-            <Text style={styles.sectionLabel}>Time format</Text>
+            <Text style={styles.subSectionLabel}>Time format</Text>
             <View style={[styles.fontRow, {marginTop: 4}]}>
               <Pressable
                 style={[styles.fontChip, !config.use24HourTime && styles.fontChipOn]}
@@ -929,39 +1058,13 @@ export default function Home() {
               Applies to times drawn on the page.
             </Text>
 
-            <Text style={styles.sectionLabel}>On-page SYNC button</Text>
-            <View style={[styles.fontRow, {marginTop: 4}]}>
-              <Pressable
-                style={[styles.fontChip, config.onPageSyncEnabled !== false && styles.fontChipOn]}
-                onPress={() => setConfig({...config, onPageSyncEnabled: true})}>
-                <Text
-                  style={[
-                    styles.fontChipText,
-                    config.onPageSyncEnabled !== false && styles.fontChipTextOn,
-                  ]}>
-                  On
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[styles.fontChip, config.onPageSyncEnabled === false && styles.fontChipOn]}
-                onPress={() => setConfig({...config, onPageSyncEnabled: false})}>
-                <Text
-                  style={[
-                    styles.fontChipText,
-                    config.onPageSyncEnabled === false && styles.fontChipTextOn,
-                  ]}>
-                  Off
-                </Text>
-              </Pressable>
-            </View>
-            <Text style={styles.toggleHint}>
-              The SYNC button drawn on the page. Turn off if it fires by accident.
-            </Text>
-
-            <Text style={styles.versionText}>
-              Settings save automatically · Ink2Task v{pluginConfig.versionName}
-            </Text>
+          </View>
+          )}
         </View>
+
+        <Text style={styles.versionText}>
+          Settings save automatically · Ink2Task v{pluginConfig.versionName}
+        </Text>
       </ScrollView>
     </View>
   );
@@ -995,8 +1098,36 @@ function Field({
 const styles = StyleSheet.create({
   container: {flex: 1, backgroundColor: '#ffffff'},
   scroll: {padding: 24, paddingTop: 48},
-  closeButton: {position: 'absolute', top: 12, right: 12, padding: 10, zIndex: 10},
-  closeText: {fontSize: 20, fontWeight: '600', color: '#000000'},
+  // A circle, not a padded glyph. Sized as a square with borderRadius = half
+  // the side so it cannot come out as an oval, and the X is centred by the
+  // container rather than by its own padding -- padding centres the BOX, not
+  // the glyph inside it, which is what left the old X sitting off-centre.
+  // Filled circle with a white X. borderRadius is exactly half the side so it
+  // cannot render as an oval, and the glyph is centred by the container rather
+  // than by its own padding -- padding centres the BOX, not the mark inside it.
+  closeButton: {
+    position: 'absolute',
+    // Sits a little lower than the very top edge so it reads as centred
+    // against the title rather than crowding the corner.
+    top: 20,
+    right: 12,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#000000',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+  },
+  closeText: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#ffffff',
+    // The glyph's line box is taller than the mark, so it sits low in a circle
+    // unless the line height matches the font size exactly.
+    lineHeight: 22,
+    textAlign: 'center',
+  },
   title: {fontSize: 28, fontWeight: '700', color: '#000000', marginBottom: 4},
   subtitle: {fontSize: 16, color: '#333333', marginBottom: 24},
   primaryButton: {
@@ -1037,6 +1168,9 @@ const styles = StyleSheet.create({
   activeProfileNote: {fontSize: 16, fontWeight: '700', color: '#000000', marginTop: 2, marginBottom: 2},
   // "Step 1 / Step 2" sub-headings inside the Sync Settings box.
   stepLabel: {
+    // Uppercase to match the section title bars: these are the headings within
+    // a section, and mixed case made them read as body text next to the bars.
+    textTransform: 'uppercase',
     fontSize: 17,
     fontWeight: '700',
     color: '#000000',
@@ -1065,6 +1199,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   statusText: {fontSize: 17, color: '#000000'},
+  errorText: {fontSize: 17, color: '#000000', padding: 24, textAlign: 'center'},
   hint: {fontSize: 15, color: '#555555', marginBottom: 16},
   settingsHeading: {
     marginTop: 28,
@@ -1076,8 +1211,40 @@ const styles = StyleSheet.create({
     borderTopColor: '#cccccc',
     paddingTop: 20,
   },
-  settingsBox: {marginTop: 0},
+  // Each section is a framed card: a solid black title bar flush inside a
+  // rounded border, with the section's controls below it. On e-ink a filled bar
+  // separates sections far more clearly than a hairline rule, which is what
+  // this replaces -- at this size a 1px grey line barely reads at all.
+  settingsBox: {
+    marginTop: 22,
+    borderWidth: 2,
+    borderColor: '#000000',
+    borderRadius: 10,
+    overflow: 'hidden', // keeps the filled bar's corners inside the frame
+  },
   sectionLabel: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#ffffff',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    flexShrink: 1,
+  },
+  // The title bar itself. Also the tap target for collapsing the section.
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#000000',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  // Body padding lives here, not on the frame, so the black bar can run edge
+  // to edge while the controls stay inset.
+  sectionBody: {paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16},
+  // Headings for groups WITHIN a section. These stay dark-on-white: making them
+  // filled bars too would compete with the section titles and flatten the
+  // hierarchy back out. Keeps the underline the section titles gave up.
+  subSectionLabel: {
     fontSize: 18,
     fontWeight: '700',
     color: '#000000',
@@ -1087,16 +1254,18 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     paddingBottom: 4,
     borderBottomWidth: 1,
-    borderBottomColor: '#dddddd',
+    borderBottomColor: '#cccccc',
     flexShrink: 1,
   },
-  // Row that makes a section heading tappable to collapse/expand.
-  sectionHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+  // BEFORE the title, not after it: the marker belongs with the thing it
+  // opens, and on the right it read as decoration at the far end of a black
+  // bar. White, since it sits on the filled bar.
+  collapseChevron: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ffffff',
+    marginRight: 12,
   },
-  collapseChevron: {fontSize: 18, fontWeight: '700', color: '#000000', marginLeft: 8, marginTop: 22},
   fontRow: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4},
   // Font chips and the List-size stepper share one row.
   appearanceRow: {flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 4},

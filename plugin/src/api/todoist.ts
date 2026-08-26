@@ -14,6 +14,7 @@
  * close/reopen still return 204 with no body.
  */
 import type {RemoteReminder} from './macServer';
+import {requireInternet} from '../utils/permissions';
 
 const API_BASE = 'https://api.todoist.com/api/v1';
 const TIMEOUT_MS = 12000; // cloud round-trip; more generous than the LAN timeout
@@ -44,6 +45,9 @@ type Task = {
 type Paginated<T> = {results?: T[]; next_cursor?: string | null};
 
 async function td(token: string, path: string, init: RequestInit = {}): Promise<Response> {
+  // Direct-Todoist is https and bypasses lanFetch entirely, so it needs its own
+  // gate -- see requireInternet.
+  await requireInternet();
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = setTimeout(() => ctrl?.abort(), TIMEOUT_MS);
   try {

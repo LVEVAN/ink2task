@@ -17,7 +17,7 @@ description: "Build, debug, and extend Supernote e-ink device plugins using the 
 
 This skill was written for a different plugin. Some of it is wrong for this
 codebase, and the rest is what we learned the hard way. Everything here was
-verified on our own hardware — items 1-5 on an A5X, items 6-15 on a Manta
+verified on our own hardware — items 1-5 on an A5X, items 6-16 on a Manta
 (added 2026-08-23), which is where the device-specific ones matter.
 
 1. **Gotcha #9 says call `saveCurrentNote()` BEFORE `insertElements` /
@@ -173,7 +173,17 @@ verified on our own hardware — items 1-5 on an A5X, items 6-15 on a Manta
     the version in the release notes, not the filename. Also: a reinstall needs
     a **remove first**, because the host caches an unpacked copy.
 
-15. **Jest cannot transform `sn-plugin-lib` or `react-native-fs` (ESM), so
+15. **`showRattaDialog`'s boolean is the RIGHT-hand button.** The signature is
+    `showRattaDialog(tip, leftBtnTxt, rightBtnTxt, isSuccess): Promise<boolean>`
+    and the SDK never says which button `true` means. Device-confirmed on a
+    Manta 2026-08-24: `left="Keep" right="Delete" -> true`, with the delete
+    actually happening. So put the CONFIRMING action on the right. For anything
+    irreversible, still write the call so that only an explicit `true` acts and
+    every other outcome (the other button, a dismissed dialog, a throw) is the
+    safe one -- then a firmware change to the button order shows up as "nothing
+    happens" instead of as destroyed user data.
+
+16. **Jest cannot transform `sn-plugin-lib` or `react-native-fs` (ESM), so
     anything you want unit tested must import NOTHING.** Our tested modules
     (`taskText.ts`, `pagination.ts`, `deviceSize.ts`, `listMatch.ts`,
     `serverFeatures.ts`) are deliberately import-free and hold the logic, while

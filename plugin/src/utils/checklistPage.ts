@@ -17,7 +17,7 @@
 import {PluginFileAPI, PluginCommAPI, PluginManager, Element, Geometry, PointUtils} from 'sn-plugin-lib';
 import type {RemoteReminder} from '../api/macServer';
 import type {ChecklistEntry, TaskSource, TaskSources} from './config';
-import {unwrap, recycleElements} from './sdk';
+import {unwrap, recycleElements, withTimeout} from './sdk';
 import {
   measureText,
   fitTitle,
@@ -206,6 +206,15 @@ const FOOTER_FONT = 26 / TPL_H;
 const LAST_UPDATED_TOP = 1812 / TPL_H;
 const LAST_UPDATED_BOTTOM = 1844 / TPL_H;
 const LAST_UPDATED_FONT = 22 / TPL_H;
+/** Start of the stamp's text, used to find it again in refreshTimestampOnly. */
+export const LAST_UPDATED_PREFIX = 'UPDATED: ';
+/**
+ * Width to reserve for the chain-link glyph the device draws inside a link's
+ * rect, in ems of the link's own font. Measured off the device screenshot that
+ * reported the overlap; slightly generous, because too much only shifts the
+ * text a few pixels while too little puts the glyph back over the text.
+ */
+const LINK_ICON_EM = 1.5;
 
 type PageSize = {width: number; height: number};
 
@@ -390,6 +399,16 @@ export type ChecklistStyle = {
    * are not ours to hide -- see checkboxesBaked.
    */
   maxBlankRows?: number;
+  /**
+   * Makes the footer a tappable link to this page, instead of plain text.
+   * Set by writePaginated on continuation pages only, pointing at the anchor,
+   * so "TOP OF LIST" actually goes there -- flipping back by hand
+   * was the only way before, and on a three-page list that is a real nuisance.
+   *
+   * Uses the same inline TYPE_LINK element as the task back-links (see mkLink),
+   * NOT PluginNoteAPI.insertTextLink, so it survives the next redraw.
+   */
+  footerLinkTo?: {destPath: string; destPage: number};
 };
 
 // Rectangle outline pen width for checkboxes and blank writable boxes.
@@ -890,17 +909,48 @@ export async function writeChecklist(
         ? `+ ${hiddenCount} MORE NOT SHOWN`
         : '';
   if (footerText) {
-    elementPromises.push(
-      mkText(
-        footerText,
-        px(FOOTER_LEFT),
-        px(FOOTER_RIGHT),
-        py(FOOTER_TOP),
-        py(FOOTER_BOTTOM),
-        Math.round(size.height * FOOTER_FONT),
-        1, // center
-      ),
-    );
+    const footerFont = Math.round(size.height * FOOTER_FONT);
+    if (style.footerLinkTo) {
+      // A link element has no text alignment of its own -- it draws from the
+      // left of its rect and underlines the whole width. Handing it the full
+      // footer span would put the text hard left under a page-wide underline,
+      // so measure the string and centre a rect that hugs it. measureText is
+      // the same per-glyph estimator the task rows use.
+      //
+      // LINK_ICON_EM is why this is not just the text width: the device draws
+      // its own chain-link glyph at the RIGHT EDGE of the link's rect, inside
+      // it. A rect measured to fit the text exactly leaves the glyph nowhere to
+      // go, so it lands on top of the final characters -- device-reported
+      // 2026-08-24, where "PAGE 3 OF 3" had its 3 covered. Reserving the space
+      // and centring text-plus-glyph keeps the line balanced.
+      const w = Math.round(measureText(footerText, footerFont) + footerFont * LINK_ICON_EM);
+      const mid = Math.round(size.width / 2);
+      const half = Math.round(Math.min(w, px(FOOTER_RIGHT) - px(FOOTER_LEFT)) / 2);
+      elementPromises.push(
+        mkLink(
+          footerText,
+          Math.max(px(FOOTER_LEFT), mid - half),
+          Math.min(px(FOOTER_RIGHT), mid + half),
+          py(FOOTER_TOP),
+          py(FOOTER_BOTTOM),
+          style.footerLinkTo.destPath,
+          style.footerLinkTo.destPage,
+          footerFont,
+        ),
+      );
+    } else {
+      elementPromises.push(
+        mkText(
+          footerText,
+          px(FOOTER_LEFT),
+          px(FOOTER_RIGHT),
+          py(FOOTER_TOP),
+          py(FOOTER_BOTTOM),
+          footerFont,
+          1, // center
+        ),
+      );
+    }
   }
 
   // "UPDATED: <date/time>" -- bottom center of the FULL page (both
@@ -1040,6 +1090,114 @@ export async function countInk(notePath: string, page: number): Promise<number> 
  * Returns the leftover stroke count (0 = clean) and whether a retry was made,
  * so the caller can repaint only in that rare case.
  */
+/**
+ * Rewrites ONLY the "UPDATED: ..." stamp on a page, leaving its drawing alone.
+ *
+ * This is what makes skipping a redraw possible. The stamp changes every sync,
+ * so without a way to touch just that line, no page could ever be considered
+ * unchanged and every page would keep being erased and repainted -- four full
+ * e-ink refreshes on a three-page list.
+ *
+ * Uses PluginFileAPI.modifyElements, device-proven 2026-08-24: the element
+ * count was unchanged, the target changed, and every other element survived.
+ *
+ * MUTATES THE HANDLE THE DEVICE GAVE US rather than building a fresh element.
+ * These objects are references into a native-side cache keyed by uuid, and the
+ * docs are explicit that a write naming an element that is not cached is
+ * skipped SILENTLY -- a hand-built object has no uuid and would vanish with no
+ * error, looking exactly like "modifyElements does not work".
+ *
+ * Returns false if the stamp could not be found or the write failed, so the
+ * caller can fall back to a full redraw rather than quietly leaving a stale
+ * time on the page.
+ */
+export async function refreshTimestampOnly(
+  notePath: string,
+  page: number,
+  use24h: boolean,
+): Promise<boolean> {
+  let elements: any[] = [];
+  try {
+    elements = (await unwrap<any[]>(PluginFileAPI.getElements(page, notePath), 'getElements')) || [];
+    const stamp = elements.find(
+      (el: any) =>
+        typeof el?.textBox?.textContentFull === 'string' &&
+        el.textBox.textContentFull.startsWith(LAST_UPDATED_PREFIX),
+    );
+    if (!stamp) return false;
+    stamp.textBox.textContentFull = formatLastUpdated(new Date(), use24h);
+    const res: any = await PluginFileAPI.modifyElements(notePath, page, [stamp]);
+    if (!res?.success) {
+      console.log(`[Ink2Task] timestamp refresh failed on p${page}: ${res?.error?.message || 'unknown'}`);
+      return false;
+    }
+    return true;
+  } catch (e: any) {
+    console.log(`[Ink2Task] timestamp refresh threw on p${page}: ${e?.message || e}`);
+    return false;
+  } finally {
+    // Only after the write: recycling first would invalidate the very handle
+    // modifyElements needs, and that failure is silent.
+    try {
+      recycleElements(elements);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+/**
+ * Reads the "<PLATFORM> - <LIST>" heading already drawn on a page.
+ *
+ * Exists because of a real data loss on 2026-08-24. config.pageBindings records
+ * which backend and list each page belongs to, and every destructive step
+ * checks it -- but it lives in the settings file, and when that file was reset,
+ * pages holding an Apple Reminders checklist looked unclaimed. The next Todoist
+ * sync treated them as its own spare continuation pages, cleared them, and
+ * removed them. The lists were gone.
+ *
+ * The page itself carries the answer: we draw the list's name across the top of
+ * every page we own. That heading survives a settings reset, because it lives
+ * in the note. Reading it back is the one check that cannot be undone by losing
+ * a config file.
+ *
+ * Returns '' when the page has no heading (an older page, or one drawn before
+ * headings existed) -- callers must treat that as "unknown", not "mine".
+ */
+export async function readPageHeading(notePath: string, page: number): Promise<string> {
+  let elements: any[] = [];
+  try {
+    elements = (await unwrap<any[]>(PluginFileAPI.getElements(page, notePath), 'getElements')) || [];
+    // The heading is the topmost text on the page, above the first row.
+    const firstRowTop = 0.14; // fraction of page height; HEADER_LABEL_BOTTOM is above this
+    const size: any = await unwrap(PluginFileAPI.getPageSize(notePath, page), 'getPageSize');
+    const cutoff = Math.round((size?.height ?? 0) * firstRowTop);
+    const texts = elements
+      .filter(
+        (el: any) =>
+          typeof el?.textBox?.textContentFull === 'string' &&
+          typeof el?.textBox?.textRect?.top === 'number' &&
+          el.textBox.textRect.top < cutoff,
+      )
+      .sort((a: any, b: any) => a.textBox.textRect.top - b.textBox.textRect.top);
+    // "DUE" is drawn up there too on notes that carry our chrome; it is not the
+    // list name, so skip it.
+    const heading = texts
+      .map((el: any) => String(el.textBox.textContentFull).trim())
+      .find((s: string) => s && s.toUpperCase() !== 'DUE');
+    return heading || '';
+  } catch (e: any) {
+    console.log(`[Ink2Task] readPageHeading p${page} failed:`, e?.message || e);
+    return '';
+  } finally {
+    try {
+      recycleElements(elements);
+    } catch {
+      // best effort
+    }
+  }
+}
+
 export async function verifyEraseAndRetry(
   notePath: string,
   page: number,

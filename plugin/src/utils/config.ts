@@ -11,6 +11,14 @@
  * unlike a Todoist token it's fine to leave as plain, USB-editable JSON.
  */
 import RNFS from 'react-native-fs';
+import {
+  shiftPageKeys,
+  shiftPageRef,
+  shiftTemplatedCount,
+  unshiftPageKeys,
+  unshiftPageRef,
+} from './pageShift';
+import {requireFileRead, requireFileWrite} from './permissions';
 import {PluginManager} from 'sn-plugin-lib';
 import {Dimensions, PixelRatio} from 'react-native';
 import {isMantaClass} from './deviceSize';
@@ -21,6 +29,8 @@ import {toAbsolute} from './notePicker';
 
 const CONFIG_DIR = '/storage/emulated/0/MyStyle/Ink2Task';
 const CONFIG_FILE = `${CONFIG_DIR}/config.json`;
+/** Previous good copy, taken once per session before the first write. */
+const CONFIG_BACKUP = `${CONFIG_DIR}/config.json.bak`;
 const REGISTRY_FILE = `${CONFIG_DIR}/checklist-registry.json`;
 // Where a lasso-captured task came from, so the checklist can draw a link back.
 // Deliberately its OWN file rather than a config field: the Home screen
@@ -86,7 +96,7 @@ export type Ink2TaskConfig = {
   listScale: number;
   /**
    * Whether a sync may add pages to the checklist note so a long list can
-   * continue onto page 2 and 3 (see MAX_PAGES in ./pagination).
+   * continue onto further pages, up to MAX_PAGES (see ./pagination).
    *
    * ON by default (user's call, 2026-08-22): a long list silently truncating to
    * one page is the more surprising behaviour of the two, and the pages are
@@ -127,6 +137,14 @@ export type Ink2TaskConfig = {
    * rather than a flag on the note.
    */
   templatedPages?: {[notePath: string]: number};
+  /**
+   * Fingerprint of what is currently drawn on each page, keyed by
+   * registryKey(notePath, page). Lets a sync skip repainting a page whose
+   * content has not changed -- see utils/pageSignature.ts. Missing or stale
+   * entries simply cause a redraw, which is the old behaviour, so this needs
+   * no migration and is safe to clear at any time.
+   */
+  pageSignatures?: {[key: string]: string};
   /**
    * 24-hour ("military") time instead of 12-hour AM/PM for every time drawn
    * on the checklist page (DUE times, LAST UPDATED). Off (12-hour) by
@@ -220,6 +238,12 @@ const DEFAULT_CONFIG: Ink2TaskConfig = {
 };
 
 async function ensureDir(): Promise<void> {
+  // The single choke point for WRITING to shared storage: this creates the
+  // directory. Declaring FILE:WRITE in PluginConfig.json is not granting it,
+  // and without this the preview firmware refuses the write outright ("Plugin
+  // [ink2task001] has no WRITE permission on sdcard") and everything
+  // downstream fails quietly. See utils/permissions.ts.
+  await requireFileWrite();
   const dirExists = await RNFS.exists(CONFIG_DIR);
   if (!dirExists) {
     await RNFS.mkdir(CONFIG_DIR);
@@ -248,6 +272,11 @@ async function migrateLegacy(): Promise<void> {
 }
 
 export async function loadConfig(): Promise<Ink2TaskConfig> {
+  // READ only. Opening Settings just reads this file, and asking to modify
+  // files at the same time put a second dialog in front of someone who had not
+  // yet seen the screen. The write permission is asked for when something is
+  // actually saved -- see writeConfigFile.
+  await requireFileRead();
   try {
     await migrateLegacy();
     const devicePath = await defaultNotePathForDevice();
@@ -257,7 +286,7 @@ export async function loadConfig(): Promise<Ink2TaskConfig> {
       await saveConfig(seeded);
       return seeded;
     }
-    const raw = await RNFS.readFile(CONFIG_FILE, 'utf8');
+    const raw = await readConfigOrBackup();
     const parsed = JSON.parse(raw);
     const merged = normalizeProfiles({...DEFAULT_CONFIG, ...parsed});
     // Each device gets its own note at native resolution (A5X/Nomad share
@@ -267,10 +296,54 @@ export async function loadConfig(): Promise<Ink2TaskConfig> {
       merged.notePath = devicePath;
     }
     return merged;
-  } catch (e) {
-    console.log('Ink2Task: config load failed, using defaults', e);
-    return {...DEFAULT_CONFIG};
+  } catch (e: any) {
+    // DO NOT fall back to defaults here. That is what destroyed a real config:
+    // the read was refused (no file permission on the preview firmware), this
+    // returned pristine defaults, the screen marked itself loaded, and the
+    // auto-save effect then wrote those defaults straight over the user's
+    // settings -- every host blanked and the Todoist token gone (device
+    // 2026-08-24). A read we cannot trust must stop the screen, not seed it.
+    //
+    // The genuinely-missing-file case is handled above and still seeds
+    // defaults, and readConfigOrBackup below handles a corrupt file, so this
+    // path means something unexpected went wrong and losing data is the worse
+    // outcome.
+    console.log('[Ink2Task] config load failed:', e?.message || e);
+    throw e instanceof Error ? e : new Error(String(e));
   }
+}
+
+/**
+ * Reads the config, falling back to the backup copy if the main file will not
+ * parse, and setting the bad file aside rather than deleting it.
+ *
+ * Exists because the config is the only record of a hand-typed 40-character
+ * Todoist token, on a device where that field cannot paste. Re-typing it
+ * because a file got truncated is a genuinely bad half-hour.
+ */
+async function readConfigOrBackup(): Promise<string> {
+  const raw = await RNFS.readFile(CONFIG_FILE, 'utf8');
+  try {
+    JSON.parse(raw);
+    return raw;
+  } catch {
+    // Main file is corrupt. Try the backup before doing anything destructive.
+  }
+  try {
+    if (await RNFS.exists(CONFIG_BACKUP)) {
+      const backup = await RNFS.readFile(CONFIG_BACKUP, 'utf8');
+      JSON.parse(backup);
+      console.log('[Ink2Task] config was unreadable; recovered from the backup');
+      await RNFS.writeFile(`${CONFIG_FILE}.corrupt`, raw, 'utf8').catch(() => {});
+      return backup;
+    }
+  } catch {
+    // Backup is no better; fall through.
+  }
+  // Keep the unreadable file for inspection rather than silently binning it,
+  // then let the caller's JSON.parse throw so the screen reports a problem.
+  await RNFS.writeFile(`${CONFIG_FILE}.corrupt`, raw, 'utf8').catch(() => {});
+  return raw;
 }
 
 /**
@@ -368,9 +441,76 @@ export function replaceStaleServerAddress(
   return {...config, ...top, profiles};
 }
 
-export async function saveConfig(config: Ink2TaskConfig): Promise<void> {
+/**
+ * Serialised, coalescing config writer.
+ *
+ * Settings auto-save on every change (Home.tsx has no Save button), and the
+ * token field fires one save PER KEYSTROKE. Unserialised, that launched ~40
+ * overlapping RNFS.writeFile calls at the same path while a Todoist token was
+ * typed in, and whichever finished last won -- which is not necessarily the one
+ * carrying the most characters. That is why a token could look typed in and
+ * simply not be there afterwards (device-reported 2026-08-24).
+ *
+ * `pending` also coalesces: while a write is in flight, only the LATEST
+ * snapshot is kept, so 40 keystrokes cost two or three writes rather than 40.
+ */
+let writeChain: Promise<void> = Promise.resolve();
+let pendingConfig: Ink2TaskConfig | null = null;
+/**
+ * One backup per plugin session, taken before the first write. Enough to undo a
+ * same-session accident (the defaults-overwrite above), without doubling the
+ * file writes on every keystroke.
+ */
+let backedUpThisSession = false;
+
+async function backupOnce(): Promise<void> {
+  if (backedUpThisSession) return;
+  backedUpThisSession = true;
+  try {
+    if (await RNFS.exists(CONFIG_FILE)) {
+      await RNFS.copyFile(CONFIG_FILE, CONFIG_BACKUP);
+    }
+  } catch {
+    // A missing backup only costs us a recovery option; never block the save.
+  }
+}
+
+async function writeConfigFile(config: Ink2TaskConfig): Promise<void> {
   await ensureDir();
-  await RNFS.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  await backupOnce();
+  const json = JSON.stringify(config, null, 2);
+  // Write beside the real file and move it into place, so a write interrupted
+  // half way (the plugin view being torn down, the host reclaiming us) cannot
+  // leave a truncated config behind. Falls back to writing directly if the
+  // platform will not overwrite on move -- a direct write is what we did before
+  // and is still far better than not saving at all.
+  const tmp = `${CONFIG_FILE}.tmp`;
+  try {
+    await RNFS.writeFile(tmp, json, 'utf8');
+    await RNFS.moveFile(tmp, CONFIG_FILE);
+  } catch {
+    await RNFS.writeFile(CONFIG_FILE, json, 'utf8');
+    try {
+      if (await RNFS.exists(tmp)) await RNFS.unlink(tmp);
+    } catch {
+      // leftover temp file is harmless
+    }
+  }
+}
+
+export async function saveConfig(config: Ink2TaskConfig): Promise<void> {
+  pendingConfig = config;
+  writeChain = writeChain
+    .then(async () => {
+      const next = pendingConfig;
+      if (!next) return; // a later call already wrote this snapshot
+      pendingConfig = null;
+      await writeConfigFile(next);
+    })
+    .catch(() => {
+      // Never let one failed write poison the chain for every later save.
+    });
+  return writeChain;
 }
 
 /**
@@ -457,6 +597,63 @@ export async function saveRegistryEntries(
   await RNFS.writeFile(REGISTRY_FILE, JSON.stringify(registry, null, 2), 'utf8');
 }
 
+/**
+ * Renumbers every page-indexed record after a page is inserted mid-note.
+ *
+ * Call this IMMEDIATELY after a successful insertNotePage, before anything else
+ * reads any of these stores. Inserting shifts the note's later pages up by one,
+ * and until this runs, six stores describe the note as it was a moment ago.
+ *
+ * Returns the updated config for the caller to save; the registry and
+ * erased-ink files are written here, since they have no in-memory owner.
+ *
+ * Ordering matters on failure: the files are written FIRST. If saving the
+ * config then fails, the worst case is bindings and signatures one page out,
+ * which the heading check on the page catches. If it were the other way round,
+ * the registry could claim rows on a page that has moved -- which is how a set
+ * of Apple Reminders pages was destroyed on 2026-08-24.
+ */
+export async function shiftRecordsForInsertedPage(
+  config: Ink2TaskConfig,
+  notePath: string,
+  insertedAt: number,
+): Promise<Ink2TaskConfig> {
+  const abs = toAbsolute(notePath);
+  try {
+    const registry = await loadRegistry();
+    const shifted = shiftPageKeys(registry, abs, insertedAt);
+    await ensureDir();
+    await RNFS.writeFile(REGISTRY_FILE, JSON.stringify(shifted, null, 2), 'utf8');
+
+    const erased = await loadErasedInk();
+    await RNFS.writeFile(
+      ERASED_INK_FILE,
+      JSON.stringify(shiftPageKeys(erased, abs, insertedAt)),
+      'utf8',
+    );
+  } catch (e) {
+    console.log('[Ink2Task] shifting page records failed', e);
+    throw e; // the caller must not carry on as if the insert were clean
+  }
+
+  const templated = config.templatedPages?.[abs];
+  return {
+    ...config,
+    pageBindings: shiftPageKeys(config.pageBindings ?? {}, abs, insertedAt),
+    pageSignatures: shiftPageKeys(config.pageSignatures ?? {}, abs, insertedAt),
+    ...(typeof templated === 'number'
+      ? {
+          templatedPages: {
+            ...(config.templatedPages ?? {}),
+            [abs]: shiftTemplatedCount(templated, insertedAt),
+          },
+        }
+      : {}),
+    lastViewedPage: shiftPageRef(config.lastViewedPage, abs, insertedAt) ?? undefined,
+    lassoTargetOverride: shiftPageRef(config.lassoTargetOverride, abs, insertedAt),
+  };
+}
+
 export function registryKey(notePath: string, page: number): string {
   return `${notePath}#${page}`;
 }
@@ -470,6 +667,21 @@ export function activeProfileOf(config: Ink2TaskConfig): ConnectionProfile {
 export function isDirectTodoist(config: Ink2TaskConfig): boolean {
   const p = activeProfileOf(config);
   return p.backend === 'todoist' && !!p.token && p.token.trim().length > 0;
+}
+
+/**
+ * A Todoist profile with no token at all.
+ *
+ * This is a dead end, not a configuration: isDirectTodoist goes false, so the
+ * sync looks for a todoist-server instead, which almost nobody runs. With no
+ * host set either, baseUrl builds "http://:8944/..." and the request dies on a
+ * URL with no host in it -- and the generic failure path then advises starting
+ * a server, which is the opposite of what this user needs to do (device-seen
+ * 2026-08-24). Worth naming so the message can say "enter your token".
+ */
+export function isTodoistMissingToken(config: Ink2TaskConfig): boolean {
+  const p = activeProfileOf(config);
+  return p.backend === 'todoist' && !(p.token && p.token.trim().length > 0);
 }
 
 /** Sets the Todoist token on the active profile (for the token settings field). */
@@ -782,6 +994,124 @@ export async function saveTicktickSyncMeta(meta: TickTickSyncMeta): Promise<void
  * a config written before this field existed still gets the right answer for
  * the only page it could have had.
  */
+/**
+ * Re-records a page binding from the list name drawn on the page itself.
+ *
+ * pageBindings is how every destructive step knows a page belongs to another
+ * list, and it lives in the settings file. When that file was reset, pages
+ * holding an Apple Reminders checklist looked unclaimed and a Todoist sync
+ * cleared and removed them (2026-08-24). The heading on the page survives that,
+ * so when it disagrees with the list being synced, put the binding back.
+ *
+ * Matches the profile by list name, case-insensitively, against the heading's
+ * "<PLATFORM> - <LIST>" shape. If no profile matches, the config is returned
+ * unchanged -- the caller still refuses to touch the page, which is the part
+ * that matters; recording it is only so the rest of the plugin agrees.
+ */
+/**
+ * Drops bindings and signatures for pages the note no longer has.
+ *
+ * A binding pointing past the end of the note is worse than useless: it makes
+ * pageBudget stop short at a page that does not exist, so the list refuses to
+ * use room it actually has. Seen on 2026-08-25, where a binding sat on page 2
+ * of a two-page note (pages 0 and 1) after the page it described was gone.
+ *
+ * Only prunes ABOVE the real page count, never reinterprets what is left.
+ */
+/**
+ * The remove-side counterpart of shiftRecordsForInsertedPage.
+ *
+ * Call immediately after a page is successfully removed. Removing page N slides
+ * everything above it down one, so records still describing N+1 point at the
+ * wrong page. Left unshifted, the next sync reads another list's page as
+ * unclaimed and draws over it -- which is exactly how a page of Apple Reminders
+ * was flattened on 2026-08-25, after a blank page below it was deleted.
+ */
+export async function shiftRecordsForRemovedPage(
+  config: Ink2TaskConfig,
+  notePath: string,
+  removedAt: number,
+): Promise<Ink2TaskConfig> {
+  const abs = toAbsolute(notePath);
+  try {
+    const registry = await loadRegistry();
+    await ensureDir();
+    await RNFS.writeFile(
+      REGISTRY_FILE,
+      JSON.stringify(unshiftPageKeys(registry, abs, removedAt), null, 2),
+      'utf8',
+    );
+    const erased = await loadErasedInk();
+    await RNFS.writeFile(
+      ERASED_INK_FILE,
+      JSON.stringify(unshiftPageKeys(erased, abs, removedAt)),
+      'utf8',
+    );
+  } catch (e) {
+    console.log('[Ink2Task] shifting page records after a removal failed', e);
+    throw e;
+  }
+  return {
+    ...config,
+    pageBindings: unshiftPageKeys(config.pageBindings ?? {}, abs, removedAt),
+    pageSignatures: unshiftPageKeys(config.pageSignatures ?? {}, abs, removedAt),
+    lastViewedPage: unshiftPageRef(config.lastViewedPage, abs, removedAt) ?? undefined,
+    lassoTargetOverride: unshiftPageRef(config.lassoTargetOverride, abs, removedAt),
+  };
+}
+
+export function pruneBindingsPastEnd(
+  config: Ink2TaskConfig,
+  notePath: string,
+  pageCount: number,
+): Ink2TaskConfig {
+  if (pageCount <= 0) return config; // unknown count: never prune on a guess
+  const abs = toAbsolute(notePath);
+  const dropStale = <T>(store: {[k: string]: T} | undefined) => {
+    const out: {[k: string]: T} = {};
+    let dropped = 0;
+    for (const [key, value] of Object.entries(store ?? {})) {
+      const hash = key.lastIndexOf('#');
+      const page = hash > 0 ? Number(key.slice(hash + 1)) : NaN;
+      if (key.slice(0, hash) === abs && Number.isInteger(page) && page >= pageCount) {
+        dropped++;
+        continue;
+      }
+      out[key] = value;
+    }
+    return {out, dropped};
+  };
+  const b = dropStale(config.pageBindings);
+  const s = dropStale(config.pageSignatures);
+  if (b.dropped === 0 && s.dropped === 0) return config;
+  console.log(
+    `[Ink2Task] pruned ${b.dropped} binding(s) and ${s.dropped} signature(s) past page ${pageCount - 1}`,
+  );
+  return {...config, pageBindings: b.out, pageSignatures: s.out};
+}
+
+export function bindPageToHeading(
+  config: Ink2TaskConfig,
+  notePath: string,
+  page: number,
+  heading: string,
+): Ink2TaskConfig {
+  const listPart = heading.includes(' - ') ? heading.split(' - ').slice(1).join(' - ') : '';
+  if (!listPart) return config;
+  const wanted = listPart.trim().toLowerCase();
+  const idx = config.profiles.findIndex(p => (p.listName || '').trim().toLowerCase() === wanted);
+  if (idx < 0) return config;
+  const key = registryKey(notePath, page);
+  if (config.pageBindings?.[key]) return config; // already claimed; leave it
+  return {
+    ...config,
+    pageBindings: {
+      ...(config.pageBindings ?? {}),
+      [key]: {profileIndex: idx, listName: config.profiles[idx].listName},
+    },
+  };
+}
+
 export function templatedPageCount(config: Ink2TaskConfig, notePath: string): number {
   const n = config.templatedPages?.[toAbsolute(notePath)];
   return typeof n === 'number' && n > 0 ? n : 1;

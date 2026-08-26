@@ -42,6 +42,18 @@ export type LanResponse = {
  * before the first answer landed, so they each asked the native side again and
  * each logged the transport line (seen twice in the 1.2.40 device log).
  */
+/**
+ * Lazily resolved, so the SDK never loads merely because this module was
+ * imported. ./permissions imports sn-plugin-lib; a static import here would
+ * drag it into every module that touches lanHttp, which is what broke
+ * discover.test.ts (its subject is a pure string helper).
+ */
+async function requirePermission(): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const {requireInternet} = require('./permissions');
+  await requireInternet();
+}
+
 let cleartextBlocked: boolean | null = null;
 let policyInFlight: Promise<boolean> | null = null;
 
@@ -97,6 +109,15 @@ export async function lanFetch(
   init: {method?: string; body?: string; headers?: Record<string, string>; signal?: any} = {},
   timeoutMs = 6000,
 ): Promise<LanResponse> {
+  // The bottom of the stack, so no caller can forget the permission gate.
+  // Memoised in permissions.ts, so this is a resolved promise after the first
+  // request.
+  //
+  // Required lazily, NOT imported at the top: ./permissions imports
+  // sn-plugin-lib, and a static import here would drag the SDK into every
+  // module that touches lanHttp -- which broke discover.test.ts, whose subject
+  // is a pure string helper. See the import-free note in taskText.ts.
+  await requirePermission();
   const isHttp = /^http:\/\//i.test(url);
   if (isHttp && (await isCleartextBlocked())) {
     const mod = (NativeModules as any)?.Ink2TaskNet;
@@ -115,4 +136,51 @@ export async function lanFetch(
   const res: any = await fetch(url, init as any);
   const body = await res.text();
   return toResponse(res.status, body);
+}
+
+/**
+ * Tries ONE request to a known-good server by every transport we have, and logs
+ * which of them work. A diagnostic, not part of any normal path.
+ *
+ * Written for this situation: on the plugin preview firmware, discovery sweeps
+ * the right subnet and every probe times out connecting, while the same tablet
+ * opens a TCP connection to that exact host and port from an adb shell. The adb
+ * shell runs as a DIFFERENT user than the plugin host, so it proves the network
+ * is fine and proves nothing about whether OUR process is allowed out. This
+ * tells them apart: if the platform fetch succeeds where the raw socket fails,
+ * the beta is restricting raw sockets; if neither works, the process itself is
+ * being denied the network despite the permission reading as granted.
+ */
+export async function diagnoseTransports(host: string, port: number): Promise<void> {
+  const url = `http://${host}:${port}/health`;
+  const log = (m: string) => console.log(`[Ink2Task][transport] ${m}`);
+  log(`testing ${url}`);
+
+  try {
+    const mod = (NativeModules as any)?.Ink2TaskNet;
+    const p = await mod?.getCleartextPolicy?.();
+    log(`cleartext policy: global=${p?.permittedGlobally} lan=${p?.permittedForPrivateLan}`);
+  } catch (e: any) {
+    log(`cleartext policy threw: ${e?.message || e}`);
+  }
+
+  try {
+    const mod = (NativeModules as any)?.Ink2TaskNet;
+    const res = await mod.httpRequest('GET', url, null, 4000);
+    log(
+      res?.error
+        ? `native socket: FAILED ${res.error}`
+        : `native socket: OK status=${res?.status} body=${String(res?.body).slice(0, 80)}`,
+    );
+  } catch (e: any) {
+    log(`native socket: THREW ${e?.message || e}`);
+  }
+
+  try {
+    const res: any = await fetch(url);
+    const body = await res.text();
+    log(`platform fetch: OK status=${res.status} body=${body.slice(0, 80)}`);
+  } catch (e: any) {
+    log(`platform fetch: FAILED ${e?.message || e}`);
+  }
 }

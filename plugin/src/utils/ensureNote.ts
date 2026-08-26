@@ -1,4 +1,5 @@
 import RNFS from 'react-native-fs';
+import {requireFileWrite} from './permissions';
 import {Dimensions, PixelRatio} from 'react-native';
 import {isMantaClass} from './deviceSize';
 import {PluginFileAPI, PluginManager} from 'sn-plugin-lib';
@@ -98,6 +99,9 @@ async function detectMantaClass(): Promise<boolean> {
 }
 
 async function ensureTemplate(): Promise<void> {
+  // Writes the template PNG into MyStyle, so this one genuinely needs the write
+  // permission -- see utils/permissions.ts. Cheap after the first call.
+  await requireFileWrite();
   const path = toAbsolute(TEMPLATE);
   const versionPath = toAbsolute(TEMPLATE_VERSION_FILE);
   let current = '';
@@ -200,8 +204,17 @@ export async function notePageCount(notePath: string): Promise<number> {
   try {
     const res: any = await PluginFileAPI.getNoteTotalPageNum(toAbsolute(notePath));
     const n = typeof res === 'number' ? res : res?.result;
-    return typeof n === 'number' && n > 0 ? n : 0;
-  } catch {
+    if (typeof n === 'number' && n > 0) return n;
+    // 0 means "unknown", and the whole page-growth decision hinges on it: with
+    // 0 the plugin believes it cannot extend the list and reports "the list
+    // could not use page 2" without saying why. Silent before, which is how
+    // that message reached a user with nothing to act on (2026-08-25).
+    console.log(
+      `[Ink2Task] getNoteTotalPageNum gave no usable count: ${JSON.stringify(res)?.slice(0, 200)}`,
+    );
+    return 0;
+  } catch (e: any) {
+    console.log('[Ink2Task] getNoteTotalPageNum threw:', e?.message || e);
     return 0;
   }
 }
@@ -224,6 +237,55 @@ export async function notePageCount(notePath: string): Promise<number> {
  * ./config), otherwise the next sync will think the page is un-templated and
  * draw a second SYNC button on top of the baked one.
  */
+/**
+ * Inserts one of our template pages AT a given index, not at the end.
+ *
+ * Why this exists: a list can only grow into the page directly after it, so a
+ * Todoist list on page 0 with an Apple Reminders list on page 1 had nowhere to
+ * go -- appending landed at the end of the note, past the Apple page, which can
+ * never extend the run. insertNotePage has always taken a position; we simply
+ * never used it.
+ *
+ * The caller MUST call shiftRecordsForInsertedPage straight afterwards when
+ * this returns true. Inserting renumbers every later page, and six stores key
+ * their data by absolute page index.
+ */
+export async function insertTemplatedPageAt(
+  notePath: string,
+  page: number,
+): Promise<boolean> {
+  const absolutePath = toAbsolute(notePath);
+  await ensureTemplate();
+  const before = await notePageCount(absolutePath);
+  if (before <= 0) return false;
+  // Inserting past the end is an append, which has its own function and does
+  // not need any renumbering. Refuse rather than quietly doing something else.
+  if (page < 0 || page > before) return false;
+  try {
+    const res: any = await PluginFileAPI.insertNotePage({
+      notePath: absolutePath,
+      page,
+      template: toAbsolute(TEMPLATE),
+    });
+    if (res && typeof res === 'object' && 'success' in res && !res.success) {
+      const {message = 'unknown error', code = '?'} = res.error ?? {};
+      console.log(`[Ink2Task] insertNotePage(at ${page}) failed (${code}): ${message}`);
+      return false;
+    }
+  } catch (e: any) {
+    console.log('[Ink2Task] insertNotePage threw:', e?.message);
+    return false;
+  }
+  const after = await notePageCount(absolutePath);
+  // Verified rather than assumed: the records only get renumbered if a page
+  // really did appear, and renumbering when nothing moved is its own corruption.
+  const grew = after === before + 1;
+  if (!grew) {
+    console.log(`[Ink2Task] insertNotePage(at ${page}): count went ${before} -> ${after}, not +1`);
+  }
+  return grew;
+}
+
 export async function appendTemplatedPage(notePath: string): Promise<boolean> {
   const absolutePath = toAbsolute(notePath);
   await ensureTemplate();

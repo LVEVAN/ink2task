@@ -265,6 +265,21 @@ backend confirms completed or created gets erased/redrawn.
 
 ## Troubleshooting
 
+- **"Find server on Wi-Fi" can't see a server that is definitely running, and
+  it worked yesterday.** Before blaming the server, reconnect the Wi-Fi on the
+  **computer running the server** -- and if that does not do it, on the tablet
+  too. A mesh system can put a device into a state where it still has internet
+  and can still reach *some* addresses, but stops passing traffic between
+  devices on the network -- so the tablet and the computer are on the same
+  network name, both look perfectly connected, and cannot see each other.
+  Diagnosed on an Orbi satellite 2026-08-24, where the tablet reached 111 other
+  addresses during a scan and not the Mac; toggling Wi-Fi off and on **on the
+  Mac** cleared it immediately. The computer is the less obvious end to
+  suspect, since the tablet is the device doing the complaining. Guest networks and "client isolation" or "AP
+  isolation" router settings cause the same thing permanently, so if
+  reconnecting fixes it once but it keeps returning, check whether the tablet
+  is joining a guest network.
+
 - **After installing a new build, the on-page SYNC button doesn't respond at
   all, even though you removed the old plugin first.** A "remove then
   install" only replaces the plugin's files on disk -- the Supernote's

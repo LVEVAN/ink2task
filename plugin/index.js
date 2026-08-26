@@ -111,6 +111,14 @@ function toPage(e) {
   return {x: e.x, y: e.y};
 }
 
+/**
+ * When a toolbar button was last pressed. Used to tell a genuine tap on the
+ * on-page SYNC button apart from a tap on the menu overlay that happens to sit
+ * over it -- the overlay does not stop the tap reaching us, so the two are
+ * otherwise identical (reported on r/Supernote_dev, 2026-08-25).
+ */
+let lastButtonPressAt = 0;
+
 PluginManager.registerMotionListener(1, {
   onMsg: async e => {
     try {
@@ -142,6 +150,42 @@ PluginManager.registerMotionListener(1, {
         return; // can't confirm the toggle -- fail safe, do nothing
       }
       if (config.onPageSyncEnabled === false) return;
+
+      // TEMPORARY PROBE -- remove once the question is answered.
+      //
+      // Asks the tablet whether the current view accepts handwriting, and logs
+      // it next to the tap. The point is to find out whether this can tell a
+      // real tap on the page apart from a tap that landed on the menu overlay
+      // sitting over the button. If the two report differently, we have the
+      // screen-scoped signal this file's big comment above says does not exist
+      // -- that was checked in August, and canHandwrite is new in the plugin
+      // preview firmware.
+      //
+      // Reports the raw envelope, not a tidied boolean: "false" and "the call
+      // failed" and "this firmware has no such method" all need telling apart,
+      // and collapsing them to false is how a probe lies to you.
+      // Two candidate signals for "this tap was really the menu, not the
+      // button", logged together so one test settles both.
+      let canWrite = null;
+      try {
+        const raw = PluginCommAPI.canHandwrite ? await PluginCommAPI.canHandwrite() : null;
+        canWrite = raw && raw.success ? raw.result : null;
+        const sinceButton = lastButtonPressAt ? Date.now() - lastButtonPressAt : -1;
+        console.log(
+          `[Ink2Task][probe] tap at ${Math.round(p.x)},${Math.round(p.y)} ` +
+            `canHandwrite=${JSON.stringify(raw)} msSinceButtonPress=${sinceButton}`,
+        );
+      } catch (e) {
+        console.log('[Ink2Task][probe] canHandwrite threw:', e && e.message);
+      }
+
+      // THE FIX UNDER TEST. Only an explicit false blocks: an error, a missing
+      // method, or an unreadable answer all mean "carry on", because wrongly
+      // blocking a real tap is worse than the accidental sync this prevents.
+      if (canWrite === false) {
+        console.log('[Ink2Task] on-page tap ignored: the view is not accepting handwriting (menu open?)');
+        return;
+      }
 
       const now = Date.now();
       if (now - lastFire < 2000) return;
@@ -233,6 +277,7 @@ PluginManager.registerMotionListener(1, {
           r.duesSet || [],
           r.pageOffer,
           r.pagesReclaimed || 0,
+          r.skippedForeignPages,
         );
         try {
           NativeUIUtils.showRattaDialog(
@@ -312,6 +357,11 @@ PluginManager.registerConfigButton();
 
 PluginManager.registerButtonListener({
   onButtonPress: async event => {
+    // Timestamped BEFORE the id check, deliberately: this records that a
+    // toolbar button was pressed at all, whichever one. The on-page tap handler
+    // reads it to work out whether an in-zone tap was really the user pressing
+    // a button in the menu row that happens to sit over the SYNC corner.
+    lastButtonPressAt = Date.now();
     // The main Ink2Task toolbar button (id 100): single-screen plugin, nothing
     // to branch on -- opening the view is handled by the host.
     if (!event || event.id !== LASSO_BUTTON_ID) return;
@@ -359,6 +409,7 @@ PluginManager.registerButtonListener({
           r.duesSet || [],
           r.pageOffer,
           r.pagesReclaimed || 0,
+          r.skippedForeignPages,
         );
       } catch (e) {
         summary += '\n\n⚠ Added, but the checklist redraw failed: ' + (e && e.message ? e.message : 'unknown error');

@@ -18,6 +18,7 @@ import {
   saveConfig,
   activeProfileOf,
   isDirectTodoist,
+  isTodoistMissingToken,
   setActiveConnection,
   loadTaskSources,
   saveTaskSources,
@@ -33,6 +34,8 @@ import {
 } from './api/macServer';
 import {
   writeChecklist,
+  refreshTimestampOnly,
+  readPageHeading,
   detectCheckedBoxes,
   scanMainLayer,
   takeRedrawWarning,
@@ -51,15 +54,28 @@ import type {RemoteReminder} from './api/macServer';
 import type {ChecklistEntry} from './utils/config';
 import {subtaskDepths, orderByHierarchy} from './utils/taskText';
 import {planPages, pagesToReclaim, pageBudget, MAX_PAGES} from './utils/pagination';
-import {notePageCount, appendTemplatedPage, removeNotePageAt} from './utils/ensureNote';
+import {
+  notePageCount,
+  appendTemplatedPage,
+  insertTemplatedPageAt,
+  removeNotePageAt,
+} from './utils/ensureNote';
 import {
   withTemplatedPages,
   isTemplatedPage,
   templatedPageCount,
+  bindPageToHeading,
+  shiftRecordsForInsertedPage,
+  pruneBindingsPastEnd,
+  shiftRecordsForRemovedPage,
   anchorPageFor,
 } from './utils/config';
-import {friendlyErrorMessage, isAuthFailure} from './utils/sdk';
+import {friendlyErrorMessage, isAuthFailure, withTimeout} from './utils/sdk';
 import {isListMissingError, pickReplacementList, describeListSwitch} from './utils/listMatch';
+import {ensurePermissions} from './utils/permissions';
+import {signatureOf, canSkipRedraw} from './utils/pageSignature';
+import {confirmRemovePages} from './utils/dialogs';
+import {explainDenied} from './utils/permissionPolicy';
 import type {ListChoice} from './utils/listMatch';
 import {removeBackLink} from './utils/lassoCapture';
 import {runTicktickPreSync, runTicktickPostSync} from './utils/ticktickSync';
@@ -85,6 +101,17 @@ export type FetchAndWriteResult = {
    * rather than left with a silently short list.
    */
   blockedByBinding: boolean;
+  /**
+   * Pages the redraw refused to touch because they belong to another list, so
+   * whatever was meant for them was not drawn at all.
+   */
+  skippedForeignPages: number[];
+  /** Continuation pages are switched on in Settings. */
+  autoAddOn: boolean;
+  /** The list is already using MAX_PAGES pages. */
+  atPageLimit: boolean;
+  /** Adding a page was attempted and the note refused it. */
+  growFailed: boolean;
 };
 
 export async function fetchAndWrite(
@@ -116,6 +143,11 @@ export async function fetchAndWrite(
   const fetchResult = await taskCallWithAutoRecover(config, fetchReminders);
   config = fetchResult.config;
   const reminders = fetchResult.result;
+  // The other half of the completion picture: if a task was ticked and the
+  // backend accepted it, it must NOT come back in this list. When it does, the
+  // completion never really landed, and the page redrawing it is a symptom
+  // rather than the fault.
+  console.log(`[Ink2Task] fetched ${reminders.length} task(s) to draw`);
   // TickTick only: drop sync-state for anything no longer in this fetch
   // (completed, deleted, or moved out of the synced project remotely) --
   // best-effort, mirrors reconcileBackLinks' cleanup below for task-sources.
@@ -297,6 +329,17 @@ export async function harvestPages(
     unchecked += s.unchecked;
     failed += s.failed;
     completedTitles.push(...s.completedTitles);
+    // Logged because completion was a blind spot: a page could report tasks
+    // completed while they stayed on the page, and nothing in the log said
+    // whether the ticks were seen, whether the backend accepted them, or
+    // whether the redraw simply drew them again (2026-08-24).
+    if (s.completed || s.unchecked || s.failed) {
+      console.log(
+        `[Ink2Task] completions p${p.page}: completed=${s.completed} ` +
+          `unchecked=${s.unchecked} failed=${s.failed} ` +
+          (s.completedTitles.length ? ` -> ${JSON.stringify(s.completedTitles.slice(0, 6))}` : ''),
+      );
+    }
   }
 
   return {
@@ -357,23 +400,163 @@ export async function writePaginated(params: {
   // a freshly appended page was skipped by the guard on the very sync that
   // created it, so continuation pages only appeared on the SECOND sync (device
   // 2026-08-22). Every append updates it.
+  // "<PLATFORM> - <LIST>", matching what writeChecklist prints across the top of
+  // every page it owns. Declared here because it is needed BEFORE planning (to
+  // decide whose pages are whose) as well as by the draw, clear and remove
+  // steps further down.
+  const myHeadingUpper = params.header
+    ? `${params.header.platform} - ${params.header.list}`.trim().toUpperCase()
+    : '';
   let existingPages = await notePageCount(notePath);
+  // A binding above the note's real page count makes pageBudget stop short at a
+  // page that does not exist, so the list refuses room it actually has. Clear
+  // those before deciding anything.
+  const prunedConfig = pruneBindingsPastEnd(config, notePath, existingPages);
+  if (prunedConfig !== config) {
+    config = prunedConfig;
+    try {
+      await saveConfig(config);
+    } catch {
+      // best-effort; it re-prunes next sync
+    }
+  }
   const boundPages = new Set<number>();
   for (let i = 1; i < MAX_PAGES; i++) {
     if (config.pageBindings?.[registryKey(notePath, page + i)]) boundPages.add(page + i);
   }
   let budget = pageBudget({anchorPage: page, existingPages, boundPages});
+  let growFailed = false;
   let usablePages = budget.usablePages;
 
   let plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+
+  // OWNERSHIP BEFORE PLANNING, not just before drawing.
+  //
+  // The draw-time guard stops another list's page being flattened, but by then
+  // the plan has already counted that page as room -- so the tasks assigned to
+  // it were simply never drawn anywhere. The user added a task, it WAS created
+  // in Todoist, and it never appeared on the page (device 2026-08-25). Silent
+  // truncation instead of silent destruction is an improvement, not a fix.
+  //
+  // So ask the pages themselves whose they are BEFORE deciding how much room
+  // there is. A page that names another list counts as bound, which both keeps
+  // it out of the plan and lets the insert branch below make real room by
+  // pushing it down.
+  //
+  // Only runs when more than one page is actually needed, and only for pages
+  // that exist and are not already known to be bound -- each check costs a page
+  // read, and the single-page case is the common one.
+  if (plan.pagesNeeded > 1 && myHeadingUpper) {
+    let foundForeign = false;
+    for (let i = 1; i < usablePages; i++) {
+      const probe = page + i;
+      if (boundPages.has(probe)) continue;
+      if (existingPages > 0 && probe >= existingPages) break;
+      const heading = await readPageHeading(notePath, probe);
+      if (heading && heading.toUpperCase() !== myHeadingUpper) {
+        console.log(
+          `[Ink2Task] p${probe} belongs to "${heading}", not this list -- not counting it as room`,
+        );
+        boundPages.add(probe);
+        config = bindPageToHeading(config, notePath, probe, heading);
+        foundForeign = true;
+      }
+    }
+    if (foundForeign) {
+      budget = pageBudget({anchorPage: page, existingPages, boundPages});
+      usablePages = budget.usablePages;
+      plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+      try {
+        await saveConfig(config);
+      } catch {
+        // best-effort; the heading check re-derives it next sync
+      }
+    }
+  }
+
+  // Logged unconditionally, because every "tasks didn't fit" report so far has
+  // come down to one of these five numbers and none of them were recorded --
+  // leaving the on-screen message as the only evidence, and it was guessing.
+  console.log(
+    `[Ink2Task] pages: anchor=${page} existing=${existingPages} usable=${usablePages} ` +
+      `needed=${plan.pagesNeeded} overflow=${plan.overflow} canGrow=${budget.canGrow} ` +
+      `boundNext=${budget.blockedByBinding} autoAdd=${config.autoAddPages !== false}`,
+  );
   // Grow only when the user opted in AND the shortfall is actually fixable by
   // adding a page (budget.canGrow). Growing on any shortfall is what made pages
   // multiply on device: the next page was bound to another list, so appending
   // could never help, and every sync appended another one anyway.
+  // BLOCKED MID-NOTE: the run cannot be extended by appending, because the page
+  // straight after it already exists. Insert one in place instead, which is
+  // what insertNotePage's page argument is for -- appending would land past
+  // whatever follows and never join this run.
+  //
+  // This DOES insert ahead of a page bound to another list, pushing it one page
+  // down the note. It was refused at first on the grounds that moving somebody
+  // else's checklist is not ours to do; the user's answer (2026-08-25) is that
+  // adding the page is the expected default and being told "6 tasks didn't fit"
+  // instead is the wrong behaviour. Nothing is destroyed -- the other list's
+  // page moves, and shiftRecordsForInsertedPage moves its records with it.
+  // If that renumbering were ever wrong, the page-heading check in the clear
+  // and remove steps is what stops the misalignment being acted on.
+  if (config.autoAddPages !== false && plan.pagesNeeded > usablePages && !budget.canGrow) {
+    const at = page + usablePages;
+    console.log(
+      `[Ink2Task] list is blocked at p${at}` +
+        (budget.blockedByBinding ? ' (bound to another list, pushing it down)' : '') +
+        '; inserting a page there',
+    );
+    if (await insertTemplatedPageAt(notePath, at)) {
+      // Renumber BEFORE anything reads a page-indexed store again.
+      config = await shiftRecordsForInsertedPage(config, notePath, at);
+      // Record the new page as one WE created, the same way the append path
+      // does. Without this it is a page nothing can ever tidy away: page
+      // removal only touches pages in this record, so an inserted page would
+      // outlive the list that needed it. Note shiftTemplatedCount does not
+      // cover this case -- inserting at the END of our run leaves the count
+      // alone, and this insert always lands exactly there.
+      config = withTemplatedPages(config, notePath, at + 1);
+      try {
+        await saveConfig(config);
+      } catch {
+        // The files are already renumbered; a lost config costs bindings being
+        // one page out, which the page-heading check catches.
+      }
+      existingPages = await notePageCount(notePath);
+      // REBUILD boundPages from the shifted config, do not reuse the set from
+      // before the insert. That set still said page N was bound to another
+      // list, when the insert had just moved that list to N+1 and made N ours.
+      // So the budget came back unchanged, the plan stayed one page, and the
+      // user was told "6 tasks didn't fit" on a page that had just been created
+      // for them -- and since the condition was still true, the next sync
+      // inserted ANOTHER page (device-reported 2026-08-25).
+      boundPages.clear();
+      for (let i = 1; i < MAX_PAGES; i++) {
+        if (config.pageBindings?.[registryKey(notePath, page + i)]) boundPages.add(page + i);
+      }
+      budget = pageBudget({anchorPage: page, existingPages, boundPages});
+      usablePages = budget.usablePages;
+      plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+      console.log(
+        `[Ink2Task] after insert: existing=${existingPages} usable=${usablePages} ` +
+          `needed=${plan.pagesNeeded} overflow=${plan.overflow} ` +
+          `bound=[${[...boundPages].join(',')}]`,
+      );
+    } else {
+      growFailed = true;
+    }
+  }
+
   if (config.autoAddPages !== false && plan.pagesNeeded > usablePages && budget.canGrow) {
     let grown = false;
     while (usablePages < plan.pagesNeeded && budget.canGrow) {
-      if (!(await appendTemplatedPage(notePath))) break;
+      if (!(await appendTemplatedPage(notePath))) {
+        // Silent before, which is how "couldn't add a page" ended up reported
+        // to the user as "turn on the setting that is already on".
+        console.log('[Ink2Task] could not add a page to the note; giving up on growing');
+        growFailed = true;
+        break;
+      }
       usablePages++;
       grown = true;
       // Record it immediately: a page we created has the template baked in, and
@@ -408,6 +591,9 @@ export async function writePaginated(params: {
   // risks interleaving two pages' batches. Nearest page first, so the one the
   // user is looking at updates even if a later page fails.
   let firstPageCount = 0;
+  /** Pages the draw loop refused because they belong to another list. */
+  const skippedForeignPages: number[] = [];
+  let signaturesChanged = false;
   let pageIndex = -1;
   for (const planned of plan.pages) {
     pageIndex++;
@@ -417,8 +603,76 @@ export async function writePaginated(params: {
     // edited between that calculation and here, and the anchor page itself is
     // the only one we can assume exists.
     if (existingPages > 0 && target >= existingPages) break;
+    // OWNERSHIP CHECK BEFORE DRAWING. Drawing is destructive -- it wipes the
+    // page -- and this was the one destructive step without the check. Clearing
+    // and removing both read the heading printed on the page first; the draw
+    // loop trusted the bindings alone, and a binding that is missing or stale
+    // is exactly how another list's page gets flattened. That is what happened
+    // to a page of Apple Reminders on 2026-08-25.
+    //
+    // Skipped for the anchor (it is the page the user synced from, by
+    // definition ours) and for pages with no heading yet (a page we just
+    // created has nothing drawn on it).
+    if (target !== page && myHeadingUpper) {
+      const heading = await readPageHeading(notePath, target);
+      if (heading && heading.toUpperCase() !== myHeadingUpper) {
+        console.log(
+          `[Ink2Task] p${target}: NOT drawing here -- the page says "${heading}", ` +
+            `this list is "${myHeadingUpper}"`,
+        );
+        config = bindPageToHeading(config, notePath, target, heading);
+        signaturesChanged = true;
+        // Reaching here means the ownership check before planning missed it, so
+        // the rows meant for this page go nowhere. Say so: the failure the user
+        // hit was precisely a task that synced but never appeared, with nothing
+        // on screen admitting it (2026-08-25).
+        skippedForeignPages.push(target);
+        continue;
+      }
+    }
     const pageKey = registryKey(notePath, target);
     const prev = planned.offset === 0 ? previousForAnchor : (await loadRegistry())[pageKey] || [];
+    const isLastPlanned = pageIndex === plan.pages.length - 1;
+    const maxBlankRows = isLastPlanned ? undefined : 1;
+    const footerLinkTo =
+      planned.offset === 0 ? undefined : {destPath: notePath, destPage: page};
+
+    // Can this page keep the drawing it already has? Every page repainted is a
+    // full e-ink refresh, and on a three-page list only one page usually
+    // changed. See utils/pageSignature.ts -- and note ink on the page vetoes
+    // the skip, because the repaint is the only thing that erases it.
+    const signature = signatureOf({
+      tasks: planned.tasks,
+      footer: planned.footer,
+      blankRows: maxBlankRows ?? ROWS_PER_PAGE,
+      header: params.header ? `${params.header.platform}/${params.header.list}` : '',
+      flags: [
+        config.listScale,
+        config.use24HourTime,
+        baseStyle.checkboxesBaked,
+        !!footerLinkTo,
+        params.honorBackendOrder,
+      ],
+    });
+    if (
+      canSkipRedraw({
+        previous: config.pageSignatures?.[pageKey],
+        next: signature,
+        inkStrokes: params.inkByPage?.get(target),
+      })
+    ) {
+      // Nothing to redraw, but the "UPDATED" stamp still has to move on, so
+      // rewrite just that one line in place. If even that fails, fall through
+      // to a full redraw rather than leave a stale time on the page.
+      const refreshed = await refreshTimestampOnly(notePath, target, !!config.use24HourTime);
+      if (refreshed) {
+        console.log(`[Ink2Task] p${target}: unchanged, skipped the repaint`);
+        if (planned.offset === 0) firstPageCount = prev.length;
+        continue;
+      }
+      console.log(`[Ink2Task] p${target}: timestamp refresh failed, redrawing`);
+    }
+
     const entries = await writeChecklist(notePath, target, planned.tasks, prev, {
       ...baseStyle,
       // Pages this plugin created carry the same baked template as page 0, so
@@ -430,10 +684,101 @@ export async function writePaginated(params: {
       // See ChecklistStyle.maxBlankRows for why the middle pages differ.
       // Indexed, not offset-derived: offsets happen to be contiguous from 0
       // today, but the last ENTRY of the plan is what "last page" means here.
-      maxBlankRows: pageIndex === plan.pages.length - 1 ? undefined : 1,
+      maxBlankRows,
+      // Continuation pages get a tappable footer back to the anchor. The anchor
+      // itself does not: it IS the top of the list, and a link to the page you
+      // are already on is just a dead spot on the page.
+      footerLinkTo,
     });
     await saveRegistryEntries(pageKey, entries);
-    if (planned.offset === 0) firstPageCount = entries.length;
+    // Only after the page really was drawn, so a failed write cannot leave a
+    // signature claiming the page is up to date.
+    config = {
+      ...config,
+      pageSignatures: {...(config.pageSignatures ?? {}), [pageKey]: signature},
+    };
+    signaturesChanged = true;
+    if (planned.offset === 0) {
+      firstPageCount = entries.length;
+    }
+  }
+
+  // ---- Clear pages the list has SHRUNK past --------------------------------
+  // When the list gets shorter, the plan covers fewer pages -- and the pages
+  // that dropped out of it were simply never touched again, so they went on
+  // displaying the old list forever. Tick off everything on page 2, and the
+  // tasks are correctly completed on the backend and correctly absent from the
+  // redraw, yet still sitting there on screen (device 2026-08-24: 11 completed,
+  // 24 tasks became 13, one page's worth, and pages 2 and 3 kept their old
+  // contents). Reclamation could not save it either, because the checkmarks
+  // still counted as ink and ink vetoes removing a page.
+  //
+  // Redrawing them empty fixes both halves: the stale list goes, and the
+  // leftover ink goes with it, which is what makes the page eligible for
+  // reclamation (and therefore the delete prompt) on this same sync.
+  const plannedTargets = new Set(plan.pages.map(pp => page + pp.offset));
+  const activePages = await activeChecklistPages(notePath, page, boundPages);
+
+  // ---- Re-learning which pages are ours: REVERTED 2026-08-24 ---------------
+  // This block used to raise config.templatedPages to cover the whole run of
+  // pages carrying our checklist, so that pages orphaned by a lost config could
+  // be tidied away again. It shipped in 1.4.2 and the user reported pages
+  // disappearing from the note on the very next sync.
+  //
+  // Whether it was the direct cause is NOT established. What is established is
+  // that it widened the set of pages this plugin is willing to DELETE, on
+  // evidence ("this page carries our drawing") that cannot distinguish a page
+  // we created from a page the user made that the list later grew onto. That is
+  // the wrong side to be wrong on: the cost of not deleting a page is clutter,
+  // the cost of deleting one is losing someone's notes with no undo.
+  //
+  // If it comes back it needs a signal that actually proves authorship -- a
+  // marker written into the page at creation time, say -- not an inference.
+
+  const myHeading = myHeadingUpper;
+  for (const active of activePages) {
+    if (plannedTargets.has(active)) continue;
+    if (existingPages > 0 && active >= existingPages) continue;
+    // Does this page actually belong to the list being synced? pageBindings
+    // says so, but it lives in the settings file -- and when that was reset,
+    // pages holding an APPLE REMINDERS checklist looked unclaimed, so a Todoist
+    // sync cleared and then deleted them (2026-08-24, real loss). The heading
+    // drawn across the top of the page is the same claim, stored in the note
+    // where a settings reset cannot reach it.
+    const heading = await readPageHeading(notePath, active);
+    if (heading && myHeading && heading.toUpperCase() !== myHeading) {
+      console.log(
+        `[Ink2Task] p${active}: leaving it alone -- it belongs to "${heading}", not "${myHeading}"`,
+      );
+      // Re-record the binding we lost, so the rest of the plugin knows too.
+      config = bindPageToHeading(config, notePath, active, heading);
+      signaturesChanged = true;
+      continue;
+    }
+    console.log(`[Ink2Task] p${active}: no longer part of the list, clearing it`);
+    const key = registryKey(notePath, active);
+    const entries = await writeChecklist(notePath, active, [], [], {
+      ...baseStyle,
+      drawChrome: !isTemplatedPage(config, notePath, active),
+      // No footer: this page is no longer part of the list, so "PAGE 2 OF 3"
+      // would be a lie and a link back to the top would imply it still belongs.
+      footerText: '',
+    });
+    await saveRegistryEntries(key, entries);
+    // It has no tasks now, so it must not claim to be up to date.
+    config = {...config, pageSignatures: {...(config.pageSignatures ?? {}), [key]: ''}};
+    signaturesChanged = true;
+    // Reclamation reads this to decide whether the page is safe to remove, and
+    // the redraw just wiped the page, so the count it holds is stale.
+    params.inkByPage?.set(active, 0);
+  }
+
+  if (signaturesChanged) {
+    try {
+      await saveConfig(config);
+    } catch {
+      // Best-effort: a lost signature only costs one extra repaint next sync.
+    }
   }
 
   // ---- Reclaim pages the shrunken list no longer needs ---------------------
@@ -453,12 +798,55 @@ export async function writePaginated(params: {
       inkByPage: params.inkByPage,
       boundPages,
     });
-    for (const p of drop) {
+    // ASK before deleting. The tasks on a continuation page can be ticked off
+    // somewhere else entirely -- a phone, or the web -- so the first this
+    // tablet hears of it is a page that has gone empty. Deleting it silently
+    // takes anything else written on that page with it, with no undo. The
+    // veto list in pagesToReclaim already refuses pages with ink on them, but
+    // that check runs on what the LAST sync saw, and this is cheap insurance
+    // on an irreversible action. See confirmRemovePages: anything other than a
+    // clear yes keeps the page.
+    if (drop.length > 0 && !(await confirmRemovePages(drop))) {
+      console.log(`[Ink2Task] page removal declined for ${drop.join(', ')}`);
+      drop.length = 0;
+    }
+    // ONE PAGE PER SYNC, hard cap. Whatever else is wrong, a bug in the
+    // decision above can then cost at most a single page per sync instead of
+    // several in one go -- and the user sees the prompt each time rather than
+    // once for a batch. Added 2026-08-24 after pages went missing from a note.
+    // drop is highest-index-first, so this takes the last page, which is the
+    // only one whose removal cannot renumber another page we are about to act
+    // on.
+    for (const p of drop.slice(0, 1)) {
+      // Never remove a page that still holds tasks. drop should already exclude
+      // it, but this is the last gate before an irreversible call and it costs
+      // one file read.
+      const stillListed = ((await loadRegistry())[registryKey(notePath, p)] || []).filter(
+        e => e.kind === 'synced',
+      ).length;
+      if (stillListed > 0) {
+        console.log(`[Ink2Task] refusing to remove p${p}: still holds ${stillListed} task(s)`);
+        continue;
+      }
+      // Same check again immediately before the irreversible call. Cheap, and
+      // this is the last chance to notice the page is someone else's.
+      const heading = await readPageHeading(notePath, p);
+      if (heading && myHeading && heading.toUpperCase() !== myHeading) {
+        console.log(`[Ink2Task] refusing to remove p${p}: it belongs to "${heading}"`);
+        continue;
+      }
+      const before = await notePageCount(notePath);
       // Clear our registry entry FIRST: if the removal succeeds, a stale entry
       // would make activeChecklistPages scan a page that no longer exists.
       await saveRegistryEntries(registryKey(notePath, p), []);
       if (await removeNotePageAt(notePath, p)) {
+        const after = await notePageCount(notePath);
+        console.log(`[Ink2Task] removed p${p}: note went from ${before} to ${after} page(s)`);
         reclaimed++;
+        // Renumber what is left. Every page above the removed one just slid
+        // down, and records that still describe the old numbers are how a page
+        // belonging to another list ends up looking unclaimed.
+        config = await shiftRecordsForRemovedPage(config, notePath, p);
         config = withTemplatedPages(config, notePath, p, {shrink: true});
       }
     }
@@ -478,7 +866,14 @@ export async function writePaginated(params: {
     usablePages,
     overflow: plan.overflow,
     pagesReclaimed: reclaimed,
+    skippedForeignPages,
     blockedByBinding: budget.blockedByBinding,
+    // Why the list could not get more room, so the summary can say the true
+    // reason instead of assuming the setting is off (2026-08-25: the user was
+    // told to turn on a setting that was already on).
+    autoAddOn: config.autoAddPages !== false,
+    atPageLimit: usablePages >= MAX_PAGES,
+    growFailed,
   };
 }
 
@@ -528,6 +923,29 @@ export type SyncResult = {
  * and a "Completed:" section, each task on its own line. Sections are omitted
  * when empty; if nothing happened it's "List up to date."
  */
+/**
+ * Why some tasks could not be shown, so the message can name the real reason.
+ *
+ * The first version had only `blockedByBinding` and otherwise assumed the
+ * "continue on more pages" setting was off -- so a user with it already ON was
+ * told to turn it on (2026-08-25). Each field below is a distinct cause with a
+ * distinct thing to do about it.
+ */
+export type PageOffer = {
+  /** Tasks that did not fit anywhere. */
+  hidden: number;
+  /** How many pages the list wanted. */
+  needed: number;
+  /** The next page belongs to another list. */
+  blockedByBinding?: boolean;
+  /** Continuation pages are switched on. */
+  autoAddOn?: boolean;
+  /** Already using the maximum number of pages. */
+  atPageLimit?: boolean;
+  /** A page was requested and the note refused to add it. */
+  growFailed?: boolean;
+};
+
 export function formatSyncSummary(
   added: string[],
   completed: string[],
@@ -538,9 +956,16 @@ export function formatSyncSummary(
    * a plain note rather than a warning: nothing failed, the user just has not
    * turned continuation pages on (or has deliberately said no).
    */
-  pageOffer?: {hidden: number; needed: number; blockedByBinding?: boolean},
+  pageOffer?: PageOffer,
   /** Continuation pages removed this sync because the list shrank. */
   pagesReclaimed = 0,
+  /**
+   * Pages the redraw refused because they belong to another list. LAST on
+   * purpose: every argument here is passed positionally, including from
+   * index.js, so inserting a parameter in the middle silently shifts the ones
+   * after it -- pagesReclaimed became this, on both on-page call sites.
+   */
+  skippedPages?: number[],
 ): string {
   const lines: string[] = [];
   if (added.length > 0) {
@@ -559,23 +984,57 @@ export function formatSyncSummary(
   }
   if (pageOffer && pageOffer.hidden > 0) {
     if (lines.length > 0) lines.push('');
-    if (pageOffer.blockedByBinding) {
-      // Adding a page cannot help here: the next page is a list of its own.
+    if (pageOffer.growFailed) {
       lines.push(
-        `${pageOffer.hidden} task(s) didn't fit, and the list can't continue`,
-        'because the next page of the note syncs a different list.',
-        'Move that page further down, or complete some tasks.',
+        `${pageOffer.hidden} task(s) didn't fit, and Ink2Task couldn't add ` +
+          'another page to this note. Add a page yourself at the end of the ' +
+          'note, then sync again.',
+      );
+    } else if (pageOffer.atPageLimit) {
+      lines.push(
+        `${pageOffer.hidden} task(s) didn't fit. The list is already using its ` +
+          `maximum of ${MAX_PAGES} pages. Complete or remove some tasks to see them.`,
+      );
+    } else if (!pageOffer.autoAddOn) {
+      lines.push(
+        `${pageOffer.hidden} task(s) didn't fit, and the list could not use ` +
+          `page ${pageOffer.needed}. Complete some tasks, or start the list on a ` +
+          'page with room after it.',
+      );
+    } else if (pageOffer.blockedByBinding) {
+      // NO LONGER says "move that page further down". That was written when the
+      // plugin refused to insert ahead of another list's page, so the user had
+      // to move it by hand. It now inserts and pushes that page down itself
+      // (2026-08-25), which makes this message reachable only when the insert
+      // was not attempted or did not help -- so it must not hand out an
+      // instruction the plugin has already carried out.
+      lines.push(
+        `${pageOffer.hidden} task(s) didn't fit. The next page of the note syncs a ` +
+          'different list, and Ink2Task could not add a page ahead of it. ' +
+          'Complete some tasks, or add a page to the note yourself just after this one.',
       );
     } else {
       lines.push(
-        `${pageOffer.hidden} task(s) didn't fit on this page.`,
-        'Turn on Sync Settings > Step 3 > "Continue on more pages"',
-        `to carry them onto page ${pageOffer.needed}.`,
+        `${pageOffer.hidden} task(s) didn't fit, and the list could not use ` +
+          `page ${pageOffer.needed}. Complete some tasks, or start the list on a ` +
+          'page with room after it.',
       );
     }
   }
+  if (skippedPages && skippedPages.length > 0) {
+    if (lines.length > 0) lines.push('');
+    lines.push(
+      `Some tasks were not drawn: page ${skippedPages.map(n => n + 1).join(', ')} of ` +
+        'this note belongs to a different list, so Ink2Task left it alone. ' +
+        'Any task you added is still saved in your task app.',
+    );
+  }
   if (pagesReclaimed > 0) {
     if (lines.length > 0) lines.push('');
+    // Singular and plural are ALTERNATIVES, not two sentences. They were
+    // originally two array elements chosen between; a sweep that joined
+    // multi-element pushes into one wrapped string concatenated them instead,
+    // so the dialog said it twice (2026-08-25).
     lines.push(
       pagesReclaimed === 1
         ? 'Removed 1 empty page the list no longer needs.'
@@ -609,8 +1068,17 @@ export async function syncCompleted(
     return {completed: 0, completedTitles: [], unchecked: 0, failed: 0};
   }
 
-  const res = await completeReminders(config, detected.map(d => d.reminderId));
+  const ids = detected.map(d => d.reminderId);
+  const res = await completeReminders(config, ids);
   const cset = new Set(res.completed);
+  // Split out from the caller's summary on purpose: "9 completed" on screen and
+  // 9 tasks still drawn on the page are only contradictory if you know whether
+  // the BACKEND accepted them. res.failed is that answer.
+  if (res.failed.length) {
+    console.log(
+      `[Ink2Task] p${page}: backend REJECTED ${res.failed.length} of ${ids.length} completion(s)`,
+    );
+  }
   const completedTitles: string[] = [];
   for (const d of detected) {
     if (cset.has(d.reminderId)) completedTitles.push(d.entry.title || '(task)');
@@ -648,7 +1116,7 @@ export type SyncThenFetch = SyncResult & {
    * or the next page is bound elsewhere. The caller shows
    * this so a shortened list is never silent about why.
    */
-  pageOffer?: {hidden: number; needed: number; blockedByBinding?: boolean};
+  pageOffer?: PageOffer;
   /** Continuation pages removed this sync because the list shrank. */
   pagesReclaimed?: number;
 };
@@ -766,6 +1234,12 @@ export async function syncThenFetch(
     // best-effort; the sync below still uses the right profile either way
   }
 
+  // Permission gate. Runs before the first file or network work of the sync,
+  // and no-ops entirely on firmware without a permission system. See
+  // utils/permissions.ts.
+  const perms = await ensurePermissions();
+  if (!perms.ok) throw new Error(explainDenied(perms.denied));
+
   // TickTick only: retry anything queued while offline BEFORE reading fresh
   // remote state below -- draining after the fetch could let a just-applied
   // edit get immediately overwritten by a stale read from the same sync.
@@ -814,12 +1288,6 @@ export async function syncThenFetch(
   });
   const added = write.added;
 
-  // Remember the ink each page just erased, so if the host restores it on a
-  // reinstall the next sync can tell those strokes from genuinely new ones.
-  // Fingerprints the RAW scan: ghosts stay ghosts until real ink replaces them.
-  for (const p of harvest.pages) {
-    await saveErasedInk(registryKey(notePath, p.page), inkPrintsOf(p.rawScan));
-  }
   // If the redraw couldn't erase the handwriting, say so -- otherwise the page
   // looks fine (the checklist covers the ink) until the plugin is removed.
   const redrawWarning = takeRedrawWarning();
@@ -831,15 +1299,43 @@ export async function syncThenFetch(
   // actually sees, and the only place a retry is worth an extra repaint. Only
   // pages that HAD ink are worth checking.
   let repainted = false;
+  const eraseFailed = new Set<number>();
   for (const p of harvest.pages) {
     if (!p.hadInk) continue;
     const {leftover, retried} = await verifyEraseAndRetry(notePath, p.page);
     if (retried && leftover === 0) repainted = true;
     if (leftover > 0) {
+      eraseFailed.add(p.page);
       warnings.push(
         `Handwriting not erased on page ${p.page + 1} -- ${leftover} stroke(s) still there after saving.`,
       );
     }
+  }
+
+  // Remember the ink each page just erased, so if the host restores it on a
+  // reinstall the next sync can tell those strokes from genuinely new ones.
+  // Fingerprints the RAW scan: ghosts stay ghosts until real ink replaces them.
+  //
+  // MOVED AFTER THE VERIFY, and skipped for any page whose erase FAILED. Doing
+  // this unconditionally was a self-perpetuating trap: when the erase failed,
+  // the surviving strokes were recorded as "already erased", so every later
+  // sync silently discarded them as ghosts -- including checkmarks drawn in
+  // those same boxes. The user ticked off a whole page, synced, and got "List
+  // up to date" with nothing completed, permanently (device 2026-08-24). Ink
+  // that is still on the page is REAL ink, whatever we intended.
+  for (const p of harvest.pages) {
+    const key = registryKey(notePath, p.page);
+    if (eraseFailed.has(p.page)) {
+      // CLEAR rather than merely skip. A page poisoned by an earlier build
+      // still carries fingerprints covering the surviving strokes, so leaving
+      // them would keep discarding the user's checkmarks forever. Wiping them
+      // costs nothing -- the worst case is that genuinely restored ink is
+      // treated as new once -- and it makes the fix retroactive for pages that
+      // are already stuck.
+      await saveErasedInk(key, []);
+      continue;
+    }
+    await saveErasedInk(key, inkPrintsOf(p.rawScan));
   }
   // A retry rewrote a page after the reload, so repaint once to show it. Rare:
   // only when ink genuinely survived the first pass.
@@ -873,6 +1369,9 @@ export async function syncThenFetch(
           hidden: write.overflow,
           needed: write.pagesNeeded,
           blockedByBinding: write.blockedByBinding,
+          autoAddOn: write.autoAddOn,
+          atPageLimit: write.atPageLimit,
+          growFailed: write.growFailed,
         }
       : undefined;
   return {
@@ -954,6 +1453,17 @@ export async function explainSyncFailure(
   // advice that was both wrong and impossible to act on (direct-Todoist mode
   // has no server to start).
   if (isAuthFailure(raw)) return base;
+  // Checked before anything about servers or Wi-Fi: a Todoist profile with no
+  // token cannot reach anything, and every message below would send the user
+  // off to fix the wrong thing.
+  if (isTodoistMissingToken(config)) {
+    return (
+      'No Todoist token is saved, so there is nothing to sync with. ' +
+      'Open Settings and enter your token from Todoist, under Settings, ' +
+      'Integrations, Developer. Type it in slowly: the field cannot paste, ' +
+      'and one wrong character is enough.'
+    );
+  }
   // A missing list already says which list. Adding "Reached the server, but
   // list X does not exist" underneath just says it twice; the useful half is
   // the names, which the branch below supplies.
@@ -974,10 +1484,11 @@ export async function explainSyncFailure(
       const lists = await fetchLists(config);
       if (!lists.includes(config.listName)) {
         lines.push(
-          '',
-          `Todoist has no project named "${config.listName}".`,
-          lists.length ? `Available: ${lists.join(', ')}` : 'Todoist reported no projects at all.',
-        );
+        ' ' +
+          `Todoist has no project named "${config.listName}". ` +
+          `Available: ${lists.join(', ')} ` +
+          'Todoist reported no projects at all.',
+      );
       }
     } catch {
       lines.push('', "Couldn't reach Todoist -- check the Supernote is online.");
@@ -991,29 +1502,35 @@ export async function explainSyncFailure(
       lines.push('');
       if (!config.host.trim()) {
         lines.push(
-          `No address is set for ${profile.label}, and no server answered on this Wi-Fi.`,
+        `No address is set for ${profile.label}, and no server answered on this Wi-Fi. ` +
           'Start the server on your computer, then sync again.',
-        );
+      );
       } else {
         lines.push(
-          `Couldn't reach ${profile.label} at ${config.host}:${config.port}.`,
+        `Couldn't reach ${profile.label} at ${config.host}:${config.port}. ` +
           'Check the server is running and on the same Wi-Fi.',
-        );
+      );
       }
       return lines.join('\n');
     }
     // Reachable, so the list name is the next thing a sync would trip over.
     const lists = await fetchLists(healed);
     if (lists.length === 0) {
-      lines.push('', 'Reached the server, but it reported no lists at all.');
+      lines.push(
+        ' ' +
+          'Reached the server, but it reported no lists at all.',
+      );
     } else if (!lists.includes(healed.listName)) {
       lines.push(
-        '',
-        `Reached the server, but list "${healed.listName}" does not exist.`,
-        `Available: ${lists.join(', ')}`,
+        ' ' +
+          `Reached the server, but list "${healed.listName}" does not exist. ` +
+          `Available: ${lists.join(', ')}`,
       );
     } else {
-      lines.push('', `Reached the server and list "${healed.listName}" exists.`);
+      lines.push(
+        ' ' +
+          `Reached the server and list "${healed.listName}" exists.`,
+      );
     }
   } catch {
     // Diagnosis itself failed; the original message still stands.

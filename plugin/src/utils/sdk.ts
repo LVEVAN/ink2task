@@ -1,4 +1,5 @@
 import {PluginCommAPI} from 'sn-plugin-lib';
+import {isDenialMessage, withoutDenialMarker} from './permissionPolicy';
 
 /**
  * Shared unwrapping for the Supernote SDK's response envelopes.
@@ -108,6 +109,9 @@ export function isAuthFailure(raw: string): boolean {
 }
 
 export function friendlyErrorMessage(raw: string, serviceLabel?: string): string {
+  // A permission refusal already reads well; strip the internal marker and use
+  // it as-is rather than letting any branch below reword it as a network fault.
+  if (isDenialMessage(raw)) return withoutDenialMarker(raw);
   // Checked before anything else: an auth failure's raw text is a wall of JSON
   // (Todoist 401 returns error_code/event_id/retry_after/error_tag), which told
   // the user nothing about the one thing that was actually wrong -- the token.

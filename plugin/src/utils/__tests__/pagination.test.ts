@@ -1,4 +1,4 @@
-import {planPages, footerFor, pagesToReclaim, pageBudget, MAX_PAGES} from '../pagination';
+import {planPages, footerFor, pagesToReclaim, pageBudget, MAX_PAGES, BACK_TO_TOP} from '../pagination';
 
 const ROWS = 14;
 
@@ -7,6 +7,15 @@ const flat = (n: number) => Array.from({length: n}, (_, i) => ({id: `t${i}`}));
 const noDepths = new Map<string, number>();
 
 describe('footerFor', () => {
+  it('offers the way back only where there is one', () => {
+    // The anchor page IS the top of the list, so a "back to top" there would
+    // be a link to the page you are already on.
+    expect(footerFor(0, 3, 0)).not.toContain(BACK_TO_TOP);
+    expect(footerFor(1, 3, 0)).toContain(BACK_TO_TOP);
+    expect(footerFor(2, 3, 0)).toContain(BACK_TO_TOP);
+    expect(footerFor(0, 1, 0)).not.toContain(BACK_TO_TOP);
+  });
+
   it('says nothing for a single page that fits', () => {
     expect(footerFor(0, 1, 0)).toBe('');
   });
@@ -16,13 +25,15 @@ describe('footerFor', () => {
   });
 
   it('points forward on a non-last page and labels it', () => {
-    expect(footerFor(0, 3, 0)).toBe('CONTINUED ON PAGE 2  -  PAGE 1 OF 3');
-    expect(footerFor(1, 3, 0)).toBe('CONTINUED ON PAGE 3  -  PAGE 2 OF 3');
+    expect(footerFor(0, 3, 0)).toBe('PAGE 1 OF 3');
+    expect(footerFor(1, 3, 0)).toBe('TOP OF LIST  -  PAGE 2 OF 3');
   });
 
   it('labels the last page and reports anything still hidden', () => {
-    expect(footerFor(2, 3, 0)).toBe('PAGE 3 OF 3');
-    expect(footerFor(2, 3, 5)).toBe('+ 5 MORE NOT SHOWN  -  PAGE 3 OF 3');
+    expect(footerFor(2, 3, 0)).toBe('TOP OF LIST  -  PAGE 3 OF 3');
+    expect(footerFor(2, 3, 5)).toBe(
+      'TOP OF LIST  -  + 5 MORE NOT SHOWN  -  PAGE 3 OF 3',
+    );
   });
 
   it('never prints PAGE 1 OF 1', () => {
@@ -56,17 +67,27 @@ describe('planPages', () => {
     // Every page keeps its last row free to write in, so 13 per page, not 14.
     expect(p.pages[0].tasks).toHaveLength(ROWS - 1);
     expect(p.pages[1].tasks).toHaveLength(20 - (ROWS - 1));
-    expect(p.pages[0].footer).toBe('CONTINUED ON PAGE 2  -  PAGE 1 OF 2');
-    expect(p.pages[1].footer).toBe('PAGE 2 OF 2');
+    expect(p.pages[0].footer).toBe('PAGE 1 OF 2');
+    expect(p.pages[1].footer).toBe(`${BACK_TO_TOP}  -  PAGE 2 OF 2`);
     expect(p.overflow).toBe(0);
   });
 
   it('caps at MAX_PAGES and reports the rest as overflow', () => {
-    const p = planPages(flat(60), noDepths, {rowsPerPage: ROWS, usablePages: 9});
+    // Derived from MAX_PAGES, not written out: this test hardcoded a 60-task
+    // list and a 3-page answer, so raising the cap turned a real assertion into
+    // a passing one (60 tasks now FIT, and the expected overflow went negative).
+    const capacity = (ROWS - 1) * MAX_PAGES;
+    const extra = 7;
+    const p = planPages(flat(capacity + extra), noDepths, {
+      rowsPerPage: ROWS,
+      usablePages: MAX_PAGES + 6,
+    });
     expect(p.pages).toHaveLength(MAX_PAGES);
     // (ROWS - 1) per page, since every page reserves a write row.
-    expect(p.overflow).toBe(60 - (ROWS - 1) * MAX_PAGES);
-    expect(p.pages[MAX_PAGES - 1].footer).toBe('+ 21 MORE NOT SHOWN  -  PAGE 3 OF 3');
+    expect(p.overflow).toBe(extra);
+    expect(p.pages[MAX_PAGES - 1].footer).toBe(
+      `${BACK_TO_TOP}  -  + ${extra} MORE NOT SHOWN  -  PAGE ${MAX_PAGES} OF ${MAX_PAGES}`,
+    );
   });
 
   it('respects usablePages, and pagesNeeded still shows what would help', () => {
@@ -211,8 +232,8 @@ describe('pageBudget', () => {
   const S = (...n: number[]) => new Set(n);
 
   it('uses every existing free page up to the cap', () => {
-    expect(pageBudget({anchorPage: 0, existingPages: 3, boundPages: S()}))
-      .toEqual({usablePages: 3, canGrow: false, blockedByBinding: false});
+    expect(pageBudget({anchorPage: 0, existingPages: MAX_PAGES, boundPages: S()}))
+      .toEqual({usablePages: MAX_PAGES, canGrow: false, blockedByBinding: false});
   });
 
   it('can grow when the run ends at the last page', () => {
@@ -231,16 +252,21 @@ describe('pageBudget', () => {
     // Run at pages 0..0 but the note has 8 pages: appending lands at index 8,
     // which can never extend this run.
     expect(pageBudget({anchorPage: 0, existingPages: 8, boundPages: S(1)}).canGrow).toBe(false);
-    // Same anchor, nothing bound: pages 1 and 2 already exist, so it uses them
-    // rather than creating anything.
+    // Same anchor, nothing bound: the following pages already exist, so it uses
+    // them up to the cap rather than creating anything. 8 existing pages is
+    // more than the cap on purpose, so this stays a "uses what is there" test
+    // whatever MAX_PAGES becomes.
     expect(pageBudget({anchorPage: 0, existingPages: 8, boundPages: S()}))
-      .toEqual({usablePages: 3, canGrow: false, blockedByBinding: false});
+      .toEqual({usablePages: MAX_PAGES, canGrow: false, blockedByBinding: false});
   });
 
   it('grows from a mid-note anchor only when that anchor is the last page', () => {
     expect(pageBudget({anchorPage: 5, existingPages: 6, boundPages: S()}))
       .toEqual({usablePages: 1, canGrow: true, blockedByBinding: false});
-    expect(pageBudget({anchorPage: 5, existingPages: 9, boundPages: S()}).canGrow).toBe(false);
+    // Anchor at 5 with enough pages after it to reach the cap: nothing to grow.
+    expect(
+      pageBudget({anchorPage: 5, existingPages: 5 + MAX_PAGES, boundPages: S()}).canGrow,
+    ).toBe(false);
   });
 
   it('never exceeds MAX_PAGES', () => {

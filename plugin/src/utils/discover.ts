@@ -13,6 +13,7 @@
 import RNFS from 'react-native-fs';
 import {NativeModules} from 'react-native';
 import {lanFetch} from './lanHttp';
+import {isDenialMessage, withoutDenialMarker} from './permissionPolicy';
 
 // Per-host probe timeout, and how many hosts are probed at once.
 //
@@ -173,10 +174,43 @@ type Probe = {ok: true; backend?: string} | null;
  * cannot change that -- it governs nothing, we run in the host's process.
  */
 const probeErrors = new Map<string, number>();
+/**
+ * Set when a probe failed because the user refused internet permission, rather
+ * than because nothing answered. Without this the sweep reports "no matching
+ * server", which reads as "your server is off" -- the two were indistinguishable
+ * on screen, which is what made the refusal so confusing (2026-08-24).
+ */
+let deniedReason = '';
+/**
+ * Ink2Task servers found during the sweep whose backend is not the one this
+ * profile wants, as backend -> "host:port". Surfaced by lastDiscoveryReport.
+ */
+const otherBackends = new Map<string, string>();
+/** Counts of each distinct probe failure, for the on-screen summary. */
+let lastCounts = {refused: 0, timedOut: 0, other: 0};
 function noteProbeError(err: unknown): void {
   let msg = err instanceof Error ? err.message : String(err);
+  if (isDenialMessage(msg)) {
+    deniedReason = withoutDenialMarker(msg);
+    return;
+  }
+  // Categorised as well as aggregated: "refused" means the plugin reached a
+  // machine and was turned away, which proves the network works -- the single
+  // most useful thing to know when a search comes back empty.
+  if (/ECONNREFUSED|Connection refused/i.test(msg)) lastCounts.refused++;
+  else if (/after \d+ms|timed? ?out/i.test(msg)) lastCounts.timedOut++;
+  else lastCounts.other++;
   // Collapse the host/port out so the same failure aggregates.
-  msg = msg.replace(/\b\d+\.\d+\.\d+\.\d+(:\d+)?/g, '<host>').slice(0, 120);
+  // Mask the addresses AND the ports. Android's connect-timeout message carries
+  // the SOURCE port too ("from /10.0.0.82 (port 45112)"), which is different on
+  // every single connection -- so masking only the IP left ~1000 near-unique
+  // strings and the "top 3" summary reported "2x" for each, hiding the fact
+  // that every probe had failed the same way (2026-08-24).
+  msg = msg
+    .replace(/\b\d+\.\d+\.\d+\.\d+/g, '<host>')
+    .replace(/\(port \d+\)/g, '(port <n>)')
+    .replace(/:\d{2,5}\b/g, ':<port>')
+    .slice(0, 140);
   probeErrors.set(msg, (probeErrors.get(msg) ?? 0) + 1);
 }
 
@@ -244,6 +278,14 @@ async function scanPool(
         }
         // wantBackend set: only an unlabeled (older) server is an acceptable fallback.
         if (r.backend === undefined && !fallback) fallback = {host: r.host, port: r.port};
+        // Remember servers of the WRONG kind. Refusing them is right -- syncing
+        // a Todoist page against a Reminders server would be worse than failing
+        // -- but reporting "no matching server" when an Ink2Task server was
+        // sitting right there, answering, is what made this look like a network
+        // fault instead of the wrong profile being selected.
+        if (r.backend && r.backend !== wantBackend) {
+          otherBackends.set(r.backend, `${r.host}:${r.port}`);
+        }
       }
     }
   }
@@ -274,6 +316,14 @@ export async function discoverServer(
     : detected.length
       ? 'from /proc'
       : 'FALLBACK, /proc unreadable and no native module';
+  // NOTE: the internet-permission gate lives in lanFetch, not here. Importing
+  // it directly would pull sn-plugin-lib into this module and make it (and its
+  // tests) unloadable under Jest -- see the import-free note in taskText.ts.
+  // The first probe therefore surfaces a refusal, which noteProbeError spots by
+  // its marker and turns into an immediate, honest failure below.
+  deniedReason = '';
+  otherBackends.clear();
+  lastCounts = {refused: 0, timedOut: 0, other: 0};
   probeErrors.clear();
   // Ask the platform whether plain http:// is even allowed in this process
   // before blaming the network. See Ink2TaskNetModule.getCleartextPolicy.
@@ -311,6 +361,10 @@ export async function discoverServer(
   for (const base of bases) {
     const hosts = Array.from({length: 254}, (_, i) => `${base}.${i + 1}`);
     const found = await scanPool(hosts, ports, backend);
+    // A refusal is not a failed search, and must never be reported as one.
+    // Thrown rather than returned as null so the caller shows this text instead
+    // of its own "no matching server".
+    if (deniedReason) throw new Error(deniedReason);
     if (found) {
       console.log(`[Ink2Task] discover: found ${found.host}:${found.port} on ${base}.x`);
       return found;
@@ -327,4 +381,76 @@ export async function discoverServer(
     );
   }
   return null;
+}
+
+/**
+ * Display name for a backend id, because the ids are ours and mean nothing to
+ * the person reading the message. "apple" is "Apple Reminders" on screen and in
+ * the profile switcher, and the message has to match what they can see.
+ */
+function serviceName(backend?: string): string {
+  switch (backend) {
+    case 'apple':
+      return 'Apple Reminders';
+    case 'google':
+      return 'Google Tasks';
+    case 'todoist':
+      return 'Todoist';
+    case 'ticktick':
+      return 'TickTick';
+    default:
+      return 'this profile';
+  }
+}
+
+/**
+ * A plain-English account of the last sweep, for the screen rather than the log.
+ *
+ * "No matching server found" was ambiguous between three situations that need
+ * completely different actions: the server is not running, the server IS
+ * running but belongs to a different profile, or nothing on the network could
+ * be reached. Each one now says which it is, names the service involved, and
+ * says what to do next.
+ */
+export function lastDiscoveryReport(wantBackend?: string): string {
+  const want = serviceName(wantBackend);
+
+  // The most confusing case by far: a working server is sitting right there,
+  // answering, and gets refused because it belongs to another profile.
+  if (otherBackends.size > 0) {
+    const [backend, where] = [...otherBackends.entries()][0];
+    const other = serviceName(backend);
+    return (
+      `Found the ${other} server at ${where}, but this page is set to ${want}. ` +
+      `Either switch to ${other} using the buttons at the top of Settings, ` +
+      `or start the ${want} server on your computer.`
+    );
+  }
+
+  const {refused, timedOut} = lastCounts;
+  if (refused > 0) {
+    // Reaching other devices proves the tablet HAS a network. It does NOT prove
+    // the computer is reachable, and an earlier version of this message said
+    // "your Wi-Fi is fine", which was wrong in the real case that produced it:
+    // a mesh satellite had silently stopped passing traffic between devices, so
+    // the tablet could reach 111 addresses and not the Mac, on the same network
+    // name (2026-08-24). Reconnecting the COMPUTER'S Wi-Fi is what cleared it,
+    // not the tablet's -- worth naming that end first, since it is the less
+    // obvious one to suspect when the tablet is the device complaining.
+    return (
+      `The tablet reached other devices on this Wi-Fi, but not the ${want} ` +
+      'server. Check it is running and the computer is awake. ' +
+      "If it is, turn the COMPUTER'S Wi-Fi off and on again, then the tablet's " +
+      '-- a mesh extender or guest network can stop two devices seeing each ' +
+      'other while both still look connected.'
+    );
+  }
+  if (timedOut > 0) {
+    return (
+      `Nothing on this Wi-Fi answered at all, so the ${want} server was never ` +
+      'reached. Check the tablet and the computer are on the same Wi-Fi, and ' +
+      'that the computer is awake.'
+    );
+  }
+  return `Could not find the ${want} server on this Wi-Fi.`;
 }

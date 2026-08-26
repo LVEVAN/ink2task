@@ -7,11 +7,20 @@
  */
 
 /**
- * Hard ceiling on pages one list may occupy. Every page costs a full page read,
- * an OCR capture pass, and a replaceElements round trip on every sync, and a
- * single-page sync is already several seconds. Three is the agreed limit.
+ * Hard ceiling on pages one list may occupy.
+ *
+ * Raised 3 -> 5 on 2026-08-24, once the per-page cost stopped being paid on
+ * every sync. Each page still costs a full page read and an OCR capture pass,
+ * but a page whose content has not changed no longer gets repainted at all --
+ * only its timestamp is rewritten in place (see utils/pageSignature.ts and
+ * refreshTimestampOnly). The repaint was the expensive part and the visible
+ * one, since each is a full-screen e-ink refresh, so five pages now costs
+ * roughly what three did before.
+ *
+ * Reading is still linear in page count, so this is not free and should not
+ * keep climbing without another look at where the time goes.
  */
-export const MAX_PAGES = 3;
+export const MAX_PAGES = 5;
 
 export type PlannedPage<T> = {
   /** 0 = the page the user synced from, 1 = the next page, and so on. */
@@ -112,6 +121,18 @@ function pack<T extends {id: string}>(
  * only shown once there is more than one page (a "PAGE 1 OF 1" on every
  * single-page list would be pure noise).
  */
+/**
+ * The label a continuation page leads with, and the reason it is worded this
+ * way rather than "BACK TO PAGE 1".
+ *
+ * The list's first page is NOT necessarily page 1 of the note -- the anchor is
+ * wherever the user started the checklist, which can be page 5 of a notebook
+ * full of other things. The footer's own "PAGE 2 OF 3" counts pages of the
+ * LIST, so a note-page number here would be a third numbering in the same
+ * line. "TOP OF LIST" sidesteps all of it and says what tapping actually does.
+ */
+export const BACK_TO_TOP = 'TOP OF LIST';
+
 export function footerFor(
   offset: number,
   totalPages: number,
@@ -119,8 +140,14 @@ export function footerFor(
 ): string {
   const parts: string[] = [];
   const isLast = offset === totalPages - 1;
-  if (!isLast) parts.push(`CONTINUED ON PAGE ${offset + 2}`);
-  else if (overflow > 0) parts.push(`+ ${overflow} MORE NOT SHOWN`);
+  // Continuation pages lead with the way back, because that is the tappable
+  // part (see ChecklistStyle.footerLinkTo) and it should be the first thing
+  // read. The anchor page gets nothing: it IS the top of the list.
+  if (offset > 0) parts.push(BACK_TO_TOP);
+  // No "CONTINUED ON PAGE N". Dropped 2026-08-24: "PAGE 1 OF 3" already says
+  // there is more and where you are in it, so the two together were saying the
+  // same thing twice in a line with no room to spare.
+  if (isLast && overflow > 0) parts.push(`+ ${overflow} MORE NOT SHOWN`);
   if (totalPages > 1) parts.push(`PAGE ${offset + 1} OF ${totalPages}`);
   // ASCII separator on purpose. A nicer glyph risks rendering as a tofu box on
   // device, which is exactly what happened to the first subtask marker.

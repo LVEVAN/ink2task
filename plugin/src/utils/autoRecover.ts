@@ -13,7 +13,7 @@
  */
 import {discoverServer} from './discover';
 import {isNetworkError} from './ticktickSync';
-import {replaceStaleServerAddress, saveConfig, isDirectTodoist} from './config';
+import {replaceStaleServerAddress, saveConfig, isDirectTodoist, isTodoistMissingToken} from './config';
 import type {Ink2TaskConfig} from './config';
 
 /**
@@ -43,6 +43,14 @@ export async function taskCallWithAutoRecover<T>(
   // the failure it produces is not always shaped like a network error, so the
   // catch below would rethrow without ever searching. Direct-Todoist has no
   // server to find, so it is excluded.
+  // A Todoist profile with no token has nothing to discover: there is no
+  // todoist-server on this network in the overwhelming majority of setups, and
+  // sweeping for one costs ~12 seconds per attempt before failing anyway (two
+  // sweeps, 24 seconds, seen on device 2026-08-24). Fail immediately with the
+  // message that actually helps.
+  if (isTodoistMissingToken(config)) {
+    throw new Error('No Todoist token is saved.');
+  }
   if (!config.host.trim() && !isDirectTodoist(config)) {
     const backend = config.profiles[config.activeProfile]?.backend;
     const found = await discoverServer(config.port, backend, config.host).catch(() => null);
