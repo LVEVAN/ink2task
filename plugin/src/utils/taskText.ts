@@ -111,8 +111,35 @@ function wrap(
 }
 
 /** How many lines `text` needs, capped at `maxLines`. */
+/**
+ * Fraction of a row's real width this module will actually fill.
+ *
+ * The glyph widths here are estimates of a font we cannot measure, and they run
+ * slightly NARROW. That only matters for a title sitting on the boundary, and
+ * then it matters a lot: a title measured at 2624px against 2648px of room for
+ * two lines was drawn by the device as THREE lines, and the third spilled down
+ * into the next task's row and collided with its text (device-reported
+ * 2026-08-26). We were wrong by under 1%.
+ *
+ * The two ways to be wrong are not equal. Underestimating overflows the row and
+ * makes two tasks unreadable; overestimating ellipsizes a title a few
+ * characters early. So this leaves a margin comfortably wider than the error
+ * observed, and accepts the occasional early "...".
+ *
+ * Not a fix for the estimates themselves -- there is no way to ask the device
+ * how wide its font renders. This is the honest way to be wrong.
+ */
+const WIDTH_SAFETY = 0.96;
+
+/** The width this module will wrap within, given a row's real width. */
+function usableWidth(widthPx: number): number {
+  return Math.floor(widthPx * WIDTH_SAFETY);
+}
+
 export function lineCount(text: string, widthPx: number, fontSizePx: number, maxLines = 2): number {
-  return Math.max(1, wrap(text, widthPx, fontSizePx, maxLines).lines.length);
+  // Same safety margin as fitTitle, so the line count used to position the text
+  // vertically agrees with the wrap that produced it.
+  return Math.max(1, wrap(text, usableWidth(widthPx), fontSizePx, maxLines).lines.length);
 }
 
 /**
@@ -130,9 +157,11 @@ export function fitTitle(
 ): string {
   const t = title.trim();
   if (!t || widthPx <= 0) return t;
+  // Wrap within slightly less than the real width -- see WIDTH_SAFETY.
+  const w = usableWidth(widthPx);
 
   // Pass 1: does it fit as-is?
-  const full = wrap(t, widthPx, fontSizePx, maxLines);
+  const full = wrap(t, w, fontSizePx, maxLines);
   if (full.consumed >= t.length) return t;
 
   // Pass 2: it must be cut, so reserve room for the ellipsis on the last line
@@ -140,7 +169,7 @@ export function fitTitle(
   // actually fit, which is the bug this function exists to avoid.
   const ell = '...';
   const ellW = measureText(ell, fontSizePx);
-  const trimmed = wrap(t, widthPx, fontSizePx, maxLines, Math.max(0, widthPx - ellW));
+  const trimmed = wrap(t, w, fontSizePx, maxLines, Math.max(0, w - ellW));
   const kept = trimmed.lines.join(' ').replace(/\s+$/, '');
   // A width so small that not even one glyph plus the ellipsis fits.
   if (!kept) return ell;

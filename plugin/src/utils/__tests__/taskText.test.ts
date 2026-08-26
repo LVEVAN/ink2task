@@ -1,14 +1,4 @@
-import {
-  findParent,
-  orderByHierarchy,
-  subtaskSiblingIndex,
-  measureText,
-  fitTitle,
-  parseSubtaskPrefix,
-  subtaskMarker,
-  subtaskDepths,
-  MAX_SUBTASK_DEPTH,
-} from '../taskText';
+import {findParent, orderByHierarchy, subtaskSiblingIndex, measureText, fitTitle, parseSubtaskPrefix, subtaskMarker, subtaskDepths, MAX_SUBTASK_DEPTH, lineCount} from '../taskText';
 
 // The real geometry of a task row on a 1404x1872 page: text spans
 // TASK_TEXT_LEFT(172) to TASK_TEXT_RIGHT(1140) and the font is ~40px.
@@ -318,5 +308,39 @@ describe('orderByHierarchy', () => {
 
   it('handles an empty list', () => {
     expect(orderByHierarchy([])).toEqual([]);
+  });
+});
+
+describe('the title that overflowed on a real device', () => {
+  // Manta geometry, derived exactly as checklistPage.ts does it: page
+  // 1920x2560, text column 172..1140 of a 1404-wide template, font 40/1872.
+  const H = 2560, W = 1920;
+  const taskW = Math.round((1140 / 1404) * W) - Math.round((172 / 1404) * W);
+  const rowHeight = Math.round((112 / 1872) * H);
+  const fontSize = Math.min(Math.round(H * (40 / 1872)), rowHeight - 24);
+  const TITLE =
+    'Your task list can grow to multiple pages and you will always have a spot ' +
+    'open on the bottom to add more.';
+
+  it('truncates it instead of spilling into the next row', () => {
+    // Device-reported 2026-08-26: this drew as THREE lines and the third
+    // collided with the next task. Our own measurement said it fitted in two,
+    // by 24px out of 2648 -- under 1% on the wrong side.
+    const out = fitTitle(TITLE, taskW, fontSize);
+    expect(out).not.toBe(TITLE);
+    expect(out.endsWith('...')).toBe(true);
+    expect(lineCount(out, taskW, fontSize)).toBeLessThanOrEqual(2);
+  });
+
+  it('still leaves a comfortably shorter title alone', () => {
+    // The guard must not start ellipsizing titles that plainly fit -- that is
+    // the bug fitTitle was written to avoid in the first place.
+    const short = 'Hand write your due dates and times.';
+    expect(fitTitle(short, taskW, fontSize)).toBe(short);
+  });
+
+  it('leaves a two-line title alone when it genuinely fits', () => {
+    const twoLine = 'Hand write your tasks and it converts to text after pressing the sync button';
+    expect(fitTitle(twoLine, taskW, fontSize)).toBe(twoLine);
   });
 });
