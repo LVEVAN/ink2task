@@ -464,3 +464,9 @@ model) reading the skill.
 
 Upstream licenses are preserved alongside the vendored files
 (`.claude/skills/supernote-plugin-dev/LICENSE-upstream.txt`).
+
+## License
+
+MIT -- see [LICENSE](LICENSE). Use it, fork it, ship it; just keep the
+copyright notice. The vendored skill files carry their own MIT notices from
+their original authors, preserved in the file named above.
