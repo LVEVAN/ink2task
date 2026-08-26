@@ -17,7 +17,7 @@ description: "Build, debug, and extend Supernote e-ink device plugins using the 
 
 This skill was written for a different plugin. Some of it is wrong for this
 codebase, and the rest is what we learned the hard way. Everything here was
-verified on our own hardware — items 1-5 on an A5X, items 6-16 on a Manta
+verified on our own hardware — items 1-5 on an A5X, items 6-18 on a Manta
 (added 2026-08-23), which is where the device-specific ones matter.
 
 1. **Gotcha #9 says call `saveCurrentNote()` BEFORE `insertElements` /
@@ -73,6 +73,12 @@ verified on our own hardware — items 1-5 on an A5X, items 6-16 on a Manta
    independently at each one — see `syncThenFetch`'s `target` option and its
    doc comment in `plugin/src/actions.ts` for the pattern that fixed exactly
    this in our lasso-capture-then-redraw flow.
+
+   **PARTLY SUPERSEDED — see correction #16.** The claim that no screen-scoped
+   signal exists was true of the SDK as it stood in August 2026. The plugin
+   preview firmware added `PluginCommAPI.canHandwrite`, which does report on the
+   current view, and it fixes the menu-overlay case. Everything above about
+   `getCurrentFilePath`/`getCurrentPageNum` still stands.
 
 6. **The whole `AndroidManifest.xml` in `plugin/android/` is INERT.** This APK
    is never installed as an app — `app.npk` is unpacked inside
@@ -183,7 +189,43 @@ verified on our own hardware — items 1-5 on an A5X, items 6-16 on a Manta
     safe one -- then a firmware change to the button order shows up as "nothing
     happens" instead of as destroyed user data.
 
-16. **Jest cannot transform `sn-plugin-lib` or `react-native-fs` (ESM), so
+16. **`canHandwrite()` IS the screen-scoped signal correction #5 says does not
+    exist.** Correction #5 concluded, correctly for its time, that nothing in
+    the SDK reports what is genuinely on screen. `PluginCommAPI.canHandwrite`
+    (sn-plugin-lib 0.1.65, plugin preview firmware) does: it reports whether the
+    current view is accepting handwriting. Device-verified on a Manta
+    2026-08-25 — six taps landing on the top menu overlay all returned
+    `{success:true, result:false}`, and normal page taps all returned `true`.
+    That fixes the long-standing "the menu overlay fires the on-page button
+    underneath it" bug, because the overlay does NOT stop taps reaching the
+    page.
+
+    Guard it as `if (canWrite === false) return;` and nothing stronger. An
+    error, a missing method, or an unreadable envelope must all let the tap
+    through, or the same build breaks on firmware without the method.
+
+    What does NOT work, checked on device: waiting ~70ms to see whether the
+    toolbar fires first (a suggestion from r/Supernote_dev). The toolbar press
+    never reaches the plugin as a button event at all — every tap logged
+    "no button press has ever happened".
+
+17. **The new page-element APIs are not usable yet, and one of them wedges the
+    plugin.** On the preview firmware, `deletePageElements` (present in the
+    library, ABSENT from the docs) genuinely removes exactly the element named
+    and leaves the rest alone. But `batchUpdatePageElements` returned
+    `success: true` while changing nothing at all when handed the same element
+    as both the delete target and the insert payload, and calling
+    `PluginFileAPI.getElements` straight after it **stops the JS thread** — a
+    `Promise.race` timeout never fired, and three syncs in a row hung. A read
+    right after `deletePageElements` came back stale instead.
+
+    So: these calls cannot verify their own work by reading the page back, and
+    a success flag from them is not evidence of anything. Element indices are
+    1-based here (`numInPage` ran 1..39 on a 39-element page) while the older
+    path-based calls are 0-based. Probe from a button, never from inside the
+    sync path.
+
+18. **Jest cannot transform `sn-plugin-lib` or `react-native-fs` (ESM), so
     anything you want unit tested must import NOTHING.** Our tested modules
     (`taskText.ts`, `pagination.ts`, `deviceSize.ts`, `listMatch.ts`,
     `serverFeatures.ts`) are deliberately import-free and hold the logic, while

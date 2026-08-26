@@ -18,6 +18,40 @@ covers plugin-specific build/setup details.
    toolbar, captures that handwriting as a new task with a link back to its
    source page.
 
+## Permissions (plugin preview firmware)
+
+On the plugin preview build the host gates file and network access, and a
+plugin that doesn't request permission gets neither -- the failure looks like
+"Plugin [ink2task001] has no WRITE permission on sdcard" in logcat, and like
+nothing working at all from the outside.
+
+`PluginConfig.json` declares them:
+
+```json
+"uses-permissions": [
+  "plugin.permission.INTERNET",
+  "plugin.permission.FILE:READ",
+  "plugin.permission.FILE:WRITE",
+  "plugin.permission.FILE:DELETE"
+]
+```
+
+Declaring is not granting. `src/utils/permissions.ts` requests them at the
+point of first use -- reading when the config is first read, writing when
+something is first saved -- rather than all at once on launch. Two things there
+are deliberate and worth keeping:
+
+- **Only grants are cached.** Caching a refusal meant that after the user
+  granted the permission in the tablet's own settings, syncing still failed
+  from memory, with no way out but restarting the plugin.
+- **Only an explicit refusal blocks.** A missing method, an error, or an
+  unrecognised permission all mean "carry on", so the same build keeps working
+  on firmware with no permission system.
+
+`FILE:DELETE` is requested but never required: element and page deletion are
+checked against `FILE:WRITE`, and the only real file deletion is one leftover
+from the pre-rename days.
+
 ## Setup
 
 1. Set up a backend first (see the [top-level README](../README.md#choosing-a-backend))

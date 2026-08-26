@@ -40,6 +40,14 @@ https://github.com/user-attachments/assets/f8f735c9-a9c2-4331-af06-d9e6e91994d2
   sync a different list, and even a different backend entirely (e.g. one page
   for Todoist, another for Apple Reminders). Ink2Task remembers what each page
   is bound to.
+- **Subtasks** -- a subtask shows with a `>` marker, and you can create one by
+  hand: write `> Milk` in a blank row and it files under the task above it.
+  Todoist, Google Tasks and TickTick. (Apple Reminders gives other apps no
+  access to subtasks at all, so it's left out rather than half-working.)
+- **Long lists carry on to more pages** -- up to five, around 65 tasks. Pages
+  are added when the list needs them and cleared away when it shrinks, asking
+  before it removes anything. Every page keeps its last row free to write in,
+  and the footer on a later page links back to the top of the list.
 - **Priority flags** -- a small flag + number shows each task's priority
   (Todoist's p1-p4, Apple Reminders' flag tiers). Visual only -- it never
   reorders the list out from under you.
@@ -135,6 +143,33 @@ box, at 8955. Set a distinct `port` in each server's `config.json` and restart
 it. Running several is otherwise fine and is what makes
 [Multiple lists on one note](#multiple-lists-on-one-note) work, with different
 pages syncing to different backends.
+
+## Firmware and permissions
+
+Ink2Task works on current Supernote firmware and on the **plugin preview
+build** ([Chauvet 3.29.43 for Manta, 2.26.40 for A5X/A6X](https://www.reddit.com/r/Supernote_dev/comments/1vx0eta/plugin_preview_build_chauvet_32943_beta_for_manta/)).
+
+The preview build added plugin permissions, and a plugin that doesn't ask for
+them can't read or write anything at all. Ink2Task asks for four:
+
+| Permission | What it's for |
+|---|---|
+| Internet | Reaching your task list, whether that's a server on your network or Todoist's cloud |
+| Read files | Reading your checklist note and the plugin's own settings |
+| Modify files | Drawing your task list onto the page, and saving settings |
+| Delete files | Clearing out one leftover file from an older version. Declining this is harmless |
+
+You'll be asked to allow reading when you open Settings, and to allow modifying
+the first time something is saved. Choose **Always allow** rather than **Allow
+this time**, which lasts only until the plugin closes.
+
+If you decline by accident, the tablet keeps the answer. Set it yourself under
+**Settings > Apps > Plugins > Ink2Task**, where *Modify Files* should read
+*Allow* rather than *Ask Every Time*. Ink2Task will also ask again on your next
+sync rather than staying stuck.
+
+On older firmware none of this applies -- the permission system simply isn't
+there, and the same plugin file works either way.
 
 ## Install
 
@@ -313,6 +348,14 @@ backend confirms completed or created gets erased/redrawn.
   itself, never whatever you were actually looking at -- so the worst case
   is an unwanted redraw and a dialog to dismiss, not lost work elsewhere.
 
+  **The related case where the top menu overlay sat over the button is now
+  fixed** (v1.5.8, plugin preview firmware only). The overlay doesn't stop
+  taps reaching the page underneath, so a tap on the menu used to look
+  identical to a tap on the button. The plugin now asks the device whether the
+  page is accepting handwriting -- with the menu open it isn't -- and ignores
+  the tap. Only a clear "no" blocks, so on older firmware, where that question
+  can't be asked, real taps still work exactly as before.
+
 ## Limitations
 
 - **No offline queue for new tasks.** Creating a task -- handwritten or
@@ -337,10 +380,13 @@ backend confirms completed or created gets erased/redrawn.
 ## Tested devices
 
 - Supernote A5X (10.2" e-ink)
+- Supernote Manta (A5X2), including the plugin preview firmware
 
 Should work on any Supernote that supports the plugin system (A5X, A6X2
 Nomad, A5X2 Manta), since layout is computed from the page size rather than
-hardcoded, but only the A5X has been tested.
+hardcoded. Each device family gets its own note file at its native resolution
+(A5X and Nomad share 1404x1872, Manta is 1920x2560), so two devices syncing the
+same account through the cloud don't fight over the page size.
 
 ## Building from source
 
