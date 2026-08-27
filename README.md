@@ -48,6 +48,13 @@ https://github.com/user-attachments/assets/f8f735c9-a9c2-4331-af06-d9e6e91994d2
   are added when the list needs them and cleared away when it shrinks, asking
   before it removes anything. Every page keeps its last row free to write in,
   and the footer on a later page links back to the top of the list.
+- **Pick your row density** -- Settings -> Formatting -> Rows per page:
+  Standard (14), Compact (18), or Dense (21) rows. Text, checkboxes, and the
+  writing boxes scale down to match, for people who write small and want more
+  tasks per page. Applies wherever Ink2Task draws the ruling itself (notes
+  created from v1.6.0 on, and "use current note" pages); a note made from the
+  older printed template keeps its baked-in 14 rows until you start a fresh
+  one. The v1.6.0 template also slims down the SYNC button and headers.
 - **Priority flags** -- a small flag + number shows each task's priority
   (Todoist's p1-p4, Apple Reminders' flag tiers). Visual only -- it never
   reorders the list out from under you.

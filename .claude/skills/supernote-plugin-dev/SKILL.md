@@ -232,6 +232,20 @@ verified on our own hardware — items 1-5 on an A5X, items 6-18 on a Manta
     the SDK-touching wrappers around them stay untested. Two suites that do
     import the SDK have never run.
 
+19. **Template PNGs are regenerated with headless Chrome, nothing else on this
+    Mac.** `qlmanage` renders our viewBox-only SVGs into a distorted square, and
+    no rsvg/inkscape/imagemagick is installed. Headless Chrome at an exact
+    viewport reproduces the shipped v16 PNG pixel-for-pixel (verified
+    2026-08-26):
+    wrap the SVG inline in an HTML shell (an `<img src>` reference rendered
+    blank), then
+    `Chrome --headless --hide-scrollbars --force-device-scale-factor=1
+    --window-size=1404,1872 --screenshot=out.png wrapper.html` — and
+    `--window-size=1920,2560` for the Manta variant (same 0.75 aspect). Note
+    the .snplg also needs the native APK: `buildPlugin.sh` on a machine with
+    no Java "succeeds" but zips a bundle-only package that would silently lose
+    `Ink2TaskNetModule` — never ship that artifact.
+
 Our own hard-won findings live in this project's Claude memory
 (`ink2task-sdk-gotchas`). Where that and this skill conflict, **the memory
 wins** — it was measured on this device against this code.

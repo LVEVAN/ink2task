@@ -45,11 +45,11 @@ import {
   recycleScan,
 } from './utils/checklistPage';
 import type {MainLayerScan} from './utils/checklistPage';
-import {ensureNote, noteHasBakedInCheckboxes} from './utils/ensureNote';
+import {ensureNote, noteHasBakedInCheckboxes, noteLayoutVersion} from './utils/ensureNote';
 import {resolveTarget, reloadIfOpen} from './utils/target';
 import type {Target} from './utils/target';
 import {captureAndCreate} from './utils/capture';
-import {N_ROWS as ROWS_PER_PAGE} from './utils/checklistPage';
+import {rowsForRun} from './utils/rowDensity';
 import type {RemoteReminder} from './api/macServer';
 import type {ChecklistEntry} from './utils/config';
 import {subtaskDepths, orderByHierarchy} from './utils/taskText';
@@ -428,7 +428,17 @@ export async function writePaginated(params: {
   let growFailed = false;
   let usablePages = budget.usablePages;
 
-  let plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+  // One row count for the whole run (pagination packs against a single
+  // rows-per-page). A note whose templated pages carry the old ruled
+  // background is pinned to its printed 14 rows; everything else follows the
+  // density setting -- see utils/rowDensity.ts.
+  const {rows: rowsPerPage, legacyRuled} = rowsForRun({
+    density: config.rowDensity,
+    noteLayoutVersion: await noteLayoutVersion(notePath),
+    hasTemplatedPages: isTemplatePage || templatedPageCount(config, notePath) > 0,
+  });
+
+  let plan = planPages(reminders, depths, {rowsPerPage, usablePages});
 
   // OWNERSHIP BEFORE PLANNING, not just before drawing.
   //
@@ -465,7 +475,7 @@ export async function writePaginated(params: {
     if (foundForeign) {
       budget = pageBudget({anchorPage: page, existingPages, boundPages});
       usablePages = budget.usablePages;
-      plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+      plan = planPages(reminders, depths, {rowsPerPage, usablePages});
       try {
         await saveConfig(config);
       } catch {
@@ -506,7 +516,7 @@ export async function writePaginated(params: {
         (budget.blockedByBinding ? ' (bound to another list, pushing it down)' : '') +
         '; inserting a page there',
     );
-    if (await insertTemplatedPageAt(notePath, at)) {
+    if (await insertTemplatedPageAt(notePath, at, {legacyRuled})) {
       // Renumber BEFORE anything reads a page-indexed store again.
       config = await shiftRecordsForInsertedPage(config, notePath, at);
       // Record the new page as one WE created, the same way the append path
@@ -536,7 +546,7 @@ export async function writePaginated(params: {
       }
       budget = pageBudget({anchorPage: page, existingPages, boundPages});
       usablePages = budget.usablePages;
-      plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+      plan = planPages(reminders, depths, {rowsPerPage, usablePages});
       console.log(
         `[Ink2Task] after insert: existing=${existingPages} usable=${usablePages} ` +
           `needed=${plan.pagesNeeded} overflow=${plan.overflow} ` +
@@ -550,7 +560,7 @@ export async function writePaginated(params: {
   if (config.autoAddPages !== false && plan.pagesNeeded > usablePages && budget.canGrow) {
     let grown = false;
     while (usablePages < plan.pagesNeeded && budget.canGrow) {
-      if (!(await appendTemplatedPage(notePath))) {
+      if (!(await appendTemplatedPage(notePath, {legacyRuled}))) {
         // Silent before, which is how "couldn't add a page" ended up reported
         // to the user as "turn on the setting that is already on".
         console.log('[Ink2Task] could not add a page to the note; giving up on growing');
@@ -572,18 +582,26 @@ export async function writePaginated(params: {
       } catch {
         // best-effort; the pages exist either way and the count re-derives
       }
-      plan = planPages(reminders, depths, {rowsPerPage: ROWS_PER_PAGE, usablePages});
+      plan = planPages(reminders, depths, {rowsPerPage, usablePages});
     }
   }
 
   const baseStyle = {
     fontPath: config.fontPath,
     scale: config.listScale,
+    rows: rowsPerPage,
+    // v17+ template pages bake only the density-independent chrome, so the
+    // interior row lines must be drawn (ignored on drawChrome pages, whose
+    // path draws the full ruling regardless). Legacy pages' ruling is printed.
+    drawInteriorRules: !legacyRuled,
+    // The v17 template's SYNC/DUE header art is ~2/3 size; the drawn title
+    // matches it. Legacy pages keep the old size next to their old baked art.
+    compactHeader: !legacyRuled,
     header: params.header,
     sources,
     honorBackendOrder: params.honorBackendOrder,
     use24HourTime: config.use24HourTime,
-    checkboxesBaked: await noteHasBakedInCheckboxes(),
+    checkboxesBaked: await noteHasBakedInCheckboxes(notePath),
   };
 
   // Sequential on purpose: each page is its own replaceElements (a whole-page
@@ -644,10 +662,12 @@ export async function writePaginated(params: {
     const signature = signatureOf({
       tasks: planned.tasks,
       footer: planned.footer,
-      blankRows: maxBlankRows ?? ROWS_PER_PAGE,
+      blankRows: maxBlankRows ?? rowsPerPage,
       header: params.header ? `${params.header.platform}/${params.header.list}` : '',
       flags: [
         config.listScale,
+        rowsPerPage,
+        legacyRuled,
         config.use24HourTime,
         baseStyle.checkboxesBaked,
         !!footerLinkTo,

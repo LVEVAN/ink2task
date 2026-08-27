@@ -95,6 +95,17 @@ export type Ink2TaskConfig = {
   /** Scales the whole checklist (text, checkboxes, rows). 1 = default size. */
   listScale: number;
   /**
+   * Task rows per page: 'standard' (14), 'compact' (18), or 'dense' (21) --
+   * see utils/rowDensity.ts. Text, checkboxes, and capture boxes scale down to
+   * match. Only applies where the plugin draws the ruling itself: notes created
+   * from the v17+ (unruled) template and "use current note" pages. A note
+   * created from the older ruled template keeps its printed 14 rows -- the
+   * ruling is baked into its page background and cannot change (see
+   * rowsForRun). Optional/undefined behaves as 'standard', so existing configs
+   * need no migration.
+   */
+  rowDensity?: 'standard' | 'compact' | 'dense';
+  /**
    * Whether a sync may add pages to the checklist note so a long list can
    * continue onto further pages, up to MAX_PAGES (see ./pagination).
    *
