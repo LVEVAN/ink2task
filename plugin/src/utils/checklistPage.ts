@@ -26,6 +26,7 @@ import {
   subtaskDepths,
   subtaskSiblingIndex,
 } from './taskText';
+import {HEADER_Y_FRAC, rowHeightFrac, rowScale as rowScaleFor} from './rowDensity';
 
 /**
  * Elements are native-backed objects, not plain data: createElement allocates
@@ -68,14 +69,16 @@ const TPL_H = 1872;
 
 // Content is inset from both side edges by SIDE_MARGIN so the Supernote's
 // side toolbar (which can sit on the left or right) never covers it.
-const HEADER_Y = 205 / TPL_H; // top of the first row / header line
-const ROW_H = 112 / TPL_H; // ruled row height
-export const N_ROWS = 14; // rows the template provides (all non-task rows are writable)
+// The table band's top (205/1872) and the per-density row height both live in
+// ./rowDensity (import-free so they're testable): HEADER_Y_FRAC and
+// rowHeightFrac(rows). At the default 14 rows they reproduce the historical
+// 205 / 112px layout exactly -- see rowDensity.test.ts.
+export const N_ROWS = 14; // rows of the v1 ruled template, and the default
 const DIVIDER_X = 1164 / TPL_W; // vertical divider between task and due columns
 
 const BOX_LEFT = 100 / TPL_W;
 const BOX_SIZE = 66 / TPL_W;
-const BOX_TOP_IN_ROW = 23 / TPL_H; // box inset from the top of its row cell
+const BOX_TOP_IN_ROW = 23 / TPL_H; // box inset from the top of its row cell (14-row layout only)
 
 // Typed titles start just right of the checkbox (which ends at 166) rather than
 // well clear of it. The SDK's text renderer adds its own internal padding
@@ -131,12 +134,20 @@ const HEADER_FONT = 46 / TPL_H; // match the template's "DUE" header size
 // for. drawHeading recenters on the shared heading line for any font size, so
 // this doesn't need any other layout change.
 const TITLE_FONT = 52 / TPL_H;
+// Compact-header variant (style.compactHeader, v17+ template pages): the v17
+// template's SYNC pill and DUE header are drawn ~2/3 the old size (device
+// feedback 2026-08-26: "headers and the sync button are pretty gigantic"), so
+// the drawn platform:list title shrinks in step or it towers over them. Legacy
+// pages keep TITLE_FONT -- a small title next to their big baked DUE looks
+// just as mismatched the other way.
+const TITLE_FONT_COMPACT = 36 / TPL_H;
 // Used only when the platform+list label doesn't fit HEADER_LABEL_LEFT..RIGHT
 // on one line at TITLE_FONT (a long list name) -- then platform and list are
 // stacked as two lines instead, sized to both fit within the HEADER_LABEL_TOP
 // ..BOTTOM band (84px at the template's native scale) rather than running
 // into the DUE column or the first task row.
 const TITLE_FONT_2LINE = 30 / TPL_H;
+const TITLE_FONT_2LINE_COMPACT = 24 / TPL_H;
 
 // Template "chrome" positions (from icon-drafts/template.svg), drawn as elements
 // on notes that lack the baked-in template background. Coordinates are fractions
@@ -163,7 +174,7 @@ const DUE_HEADER_RIGHT = 1320 / TPL_W;
 const DIVIDER_TOP = 205 / TPL_H;
 const DIVIDER_BOTTOM = 1773 / TPL_H;
 // Ruled row lines: template draws them x85..1320 at each row boundary
-// (y = HEADER_Y + i*ROW_H, for i = 0..N_ROWS).
+// (y = headerY + i*rowHeight, for i = 0..rows).
 const RULE_LEFT = 85 / TPL_W;
 const RULE_RIGHT = 1320 / TPL_W;
 // The 15 ruled-line elements are ~24% of a redraw's ~62 elements -- the single
@@ -330,6 +341,28 @@ export type ChecklistStyle = {
   fontPath?: string;
   /** Multiplier on text/checkbox/row sizes. 1 = default. */
   scale?: number;
+  /**
+   * Task rows on this page (default N_ROWS = 14). Rows subdivide the fixed
+   * table band, so more rows = shorter rows; text, checkboxes, and capture
+   * boxes shrink by the same factor (rowScale in ./rowDensity). The caller
+   * resolves this per run via rowsForRun -- a page whose baked background
+   * carries the v1 ruling must stay at 14.
+   */
+  rows?: number;
+  /**
+   * Draw the interior row-separator lines as elements. For v17+ template
+   * pages: their background bakes only the density-independent chrome (frame
+   * lines, divider, SYNC pill, DUE header), so the per-density row lines must
+   * be drawn here. Ignored when drawChrome is set -- that path already draws
+   * the full ruling including top/bottom frame lines and the divider.
+   */
+  drawInteriorRules?: boolean;
+  /**
+   * Smaller drawn platform:list title, matching the v17 template's compact
+   * SYNC/DUE header art. Off for legacy pages, whose baked header is the old
+   * larger size.
+   */
+  compactHeader?: boolean;
   /** Shown in the header between the SYNC button and "DUE": which backend + list. */
   header?: {platform: string; list: string};
   /**
@@ -423,7 +456,11 @@ export async function writeChecklist(
 ): Promise<ChecklistEntry[]> {
   _redrawWarning = ''; // fresh per redraw; read via takeRedrawWarning()
   const layer = await checklistLayer(notePath, page);
-  const scale = style.scale && style.scale > 0 ? style.scale : 1;
+  const nRows = style.rows && style.rows > 0 ? Math.round(style.rows) : N_ROWS;
+  // Everything drawn INSIDE a row shrinks with the rows themselves, and the
+  // user's list-size % multiplies on top of that.
+  const rScale = rowScaleFor(nRows);
+  const scale = (style.scale && style.scale > 0 ? style.scale : 1) * rScale;
   const fontPath = style.fontPath || '';
   const use24h = !!style.use24HourTime;
   // Only skip drawing checkbox elements when BOTH this note's background
@@ -447,11 +484,18 @@ export async function writeChecklist(
   const px = (f: number) => Math.round(size.width * f);
   const py = (f: number) => Math.round(size.height * f);
 
-  const headerY = py(HEADER_Y);
-  const rowHeight = py(ROW_H);
+  const headerY = py(HEADER_Y_FRAC);
+  const rowHeight = py(rowHeightFrac(nRows));
   const boxLeft = px(BOX_LEFT);
-  const boxSize = px(BOX_SIZE);
-  const boxTopInRow = py(BOX_TOP_IN_ROW);
+  const boxSize = Math.round(size.width * BOX_SIZE * rScale);
+  // At 14 rows this must stay the historical fixed inset -- the v1 template's
+  // BAKED checkbox outlines sit exactly there, and the computed box coords are
+  // what capture tests checkmark strokes against. At other densities the boxes
+  // are always drawn by us, so centering in the (shorter) row is correct.
+  // (Centering at 14 rows gives the same 23px on the 1872 design, but rounds
+  // differently at other page heights -- so the legacy branch is kept exact.)
+  const boxTopInRow =
+    nRows === N_ROWS ? py(BOX_TOP_IN_ROW) : Math.round((rowHeight - boxSize) / 2);
   const taskLeft = px(TASK_TEXT_LEFT);
   // Title text, the blank writable box, and the priority flag all share this
   // same right edge -- the flag is drawn overlapping the row's right end
@@ -466,8 +510,13 @@ export async function writeChecklist(
   const taskBoxRight = px(TASK_BOX_RIGHT);
   const dueBoxLeft = px(DUE_BOX_LEFT);
   const dueBoxRight = px(DUE_BOX_RIGHT);
-  // Font scales with the user's list-size setting, capped so it stays in the row.
-  const fontSize = Math.min(Math.round(size.height * FONT_SIZE * scale), rowHeight - 24);
+  // Font scales with the user's list-size setting (and the row density, folded
+  // into `scale` above), capped so it stays in the row. The cap's headroom
+  // shrinks with the row too -- a fixed 24px would swallow most of a dense row.
+  const fontSize = Math.min(
+    Math.round(size.height * FONT_SIZE * scale),
+    rowHeight - Math.max(8, Math.round(24 * rScale)),
+  );
 
   const entries: ChecklistEntry[] = [];
   // Element creation (createElement) is a native round-trip EACH, and ~66 of them
@@ -759,7 +808,7 @@ export async function writeChecklist(
     // Ruled row lines (toggle above -- ~24% of a redraw's element count) +
     // column divider (light gray, like the template).
     if (DRAW_RULED_LINES) {
-      for (let i = 0; i <= N_ROWS; i++) {
+      for (let i = 0; i <= nRows; i++) {
         const y = headerY + i * rowHeight;
         elementPromises.push(mkLine(px(RULE_LEFT), y, px(RULE_RIGHT), y, DIVIDER_WIDTH, RULE_COLOR));
       }
@@ -767,6 +816,15 @@ export async function writeChecklist(
     elementPromises.push(
       mkLine(dividerX, py(DIVIDER_TOP), dividerX, py(DIVIDER_BOTTOM), DIVIDER_WIDTH, RULE_COLOR),
     );
+  } else if (style.drawInteriorRules && DRAW_RULED_LINES) {
+    // v17+ template page: the background bakes the table frame (top/bottom
+    // lines) and the divider, but the row separators depend on the density,
+    // so they are drawn here. Interior lines only -- i=0 and i=nRows would
+    // double up on the baked frame.
+    for (let i = 1; i < nRows; i++) {
+      const y = headerY + i * rowHeight;
+      elementPromises.push(mkLine(px(RULE_LEFT), y, px(RULE_RIGHT), y, DIVIDER_WIDTH, RULE_COLOR));
+    }
   }
   // SYNC button box/label and the "DUE" column header are baked into the
   // template PNG itself (see ensureNote.ts) -- NEVER draw them as elements,
@@ -779,18 +837,21 @@ export async function writeChecklist(
   // separator rather than a bare join -- the earlier plain-space join made a
   // multi-word list name (e.g. "To Do") read as part of the platform name.
   const header = style.header;
+  const titleFont = style.compactHeader ? TITLE_FONT_COMPACT : TITLE_FONT;
   if (header && header.platform) {
     const labelW = px(HEADER_LABEL_RIGHT) - px(HEADER_LABEL_LEFT);
     const oneLine = header.list ? `${header.platform} - ${header.list}` : header.platform;
-    const oneLineFs = Math.round(size.height * TITLE_FONT);
+    const oneLineFs = Math.round(size.height * titleFont);
     const fitsOneLine = charsPerLine(labelW, oneLineFs, HEADER_CHAR_W) >= oneLine.length;
     if (!header.list || fitsOneLine) {
-      await drawHeading(oneLine.toUpperCase(), HEADER_LABEL_LEFT, HEADER_LABEL_RIGHT, TITLE_FONT);
+      await drawHeading(oneLine.toUpperCase(), HEADER_LABEL_LEFT, HEADER_LABEL_RIGHT, titleFont);
     } else {
       // A long list name doesn't fit alongside the platform on one line --
       // stack them instead of letting it run into the DUE column or clip.
       // Sized to fit both lines within HEADER_LABEL_TOP..BOTTOM.
-      const fs2 = Math.round(size.height * TITLE_FONT_2LINE);
+      const fs2 = Math.round(
+        size.height * (style.compactHeader ? TITLE_FONT_2LINE_COMPACT : TITLE_FONT_2LINE),
+      );
       const lineH2 = Math.round(fs2 * 1.3);
       const line1Top = py(HEADER_LABEL_TOP);
       const line2Top = line1Top + lineH2;
@@ -845,7 +906,7 @@ export async function writeChecklist(
 
   let slot = 0;
   for (const reminder of ordered) {
-    if (slot >= N_ROWS) break;
+    if (slot >= nRows) break;
     const rowTop = rowTopOf(slot);
     const box = await drawCheckbox(rowTop);
     if (reminder.priority) drawPriorityFlag(rowTop, reminder.priority);
@@ -878,9 +939,9 @@ export async function writeChecklist(
   // style.maxBlankRows caps how many, for a page whose list continues on the
   // next one; see the comment on that field.
   const blankLimit = style.maxBlankRows === undefined
-    ? N_ROWS
-    : Math.max(0, Math.min(N_ROWS, style.maxBlankRows));
-  const lastBlankSlot = Math.min(N_ROWS, slot + blankLimit);
+    ? nRows
+    : Math.max(0, Math.min(nRows, style.maxBlankRows));
+  const lastBlankSlot = Math.min(nRows, slot + blankLimit);
   for (; slot < lastBlankSlot; slot++) {
     const rowTop = rowTopOf(slot);
     const box = await drawCheckbox(rowTop);
@@ -901,7 +962,7 @@ export async function writeChecklist(
   // not fit, and a lone page keeps the original "+N MORE NOT SHOWN" behaviour.
   // Falls back to computing the single-page case itself so a caller that passes
   // no footer (or an older call site) still behaves as it always did.
-  const hiddenCount = ordered.length - N_ROWS;
+  const hiddenCount = ordered.length - nRows;
   const footerText =
     style.footerText !== undefined
       ? style.footerText

@@ -1,0 +1,45 @@
+<svg viewBox="0 0 1404 1872" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1404" height="1872" fill="#ffffff"/>
+
+  <!-- v17 "unruled" template. Only the DENSITY-INDEPENDENT chrome is baked in:
+       the SYNC pill, the DUE header, the table band's top/bottom frame lines,
+       and the column divider. The interior row lines and the checkboxes are
+       drawn as elements by checklistPage.ts at whatever row density the user
+       picked (see utils/rowDensity.ts), which is the whole point: a note made
+       from this template can change density at any time.
+
+       Header art is ~2/3 the v16 size (device feedback 2026-08-26: "headers
+       and the sync button are pretty gigantic"). The pill keeps its CENTER at
+       (702,142) so index.js's on-page tap zone (padded around the old
+       556..848 x 100..184 pill) still covers it unchanged -- see the warning
+       in index.js about the zone and the pill drifting apart. -->
+
+  <!-- SYNC button pill: 200x60 centered at (702,142) -> x 602..802, y 112..172 -->
+  <rect x="602" y="112" width="200" height="60" rx="30" fill="#ededed" stroke="#111111" stroke-width="4"/>
+
+  <!-- Ink-drop logo inside the pill (drop designed in a 512 box, scaled down).
+       Drop's visual bounds in its box: x 90..422, y 44..508. At scale 0.11
+       that is ~36.5 x 51px; placed ~22px in from the pill's left edge and
+       vertically centered on the pill's midline (142). -->
+  <g transform="translate(614.2,111.7) scale(0.11)">
+    <path d="M256 44 C 150 182 90 252 90 342 a 166 166 0 1 0 332 0 C 422 252 362 182 256 44 Z" fill="#111111"/>
+    <path d="M176 350 L232 408 L360 278" fill="none" stroke="#ffffff" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- SYNC label, baseline placed to center the caps on the pill midline -->
+  <text x="674" y="156" font-family="Helvetica, Arial, sans-serif" font-size="40" font-weight="800" fill="#111111" letter-spacing="1">SYNC</text>
+
+  <!-- DUE column header, centered over the due column (divider 1164 .. right 1320),
+       baseline on the same visual line as SYNC's -->
+  <text x="1242" y="154" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#333333" letter-spacing="2">DUE</text>
+
+  <!-- Table band frame: top and bottom lines only. The interior row
+       separators are density-dependent and drawn as elements. -->
+  <g stroke="#c8c8c8" stroke-width="2">
+    <line x1="85" y1="205" x2="1320" y2="205"/>
+    <line x1="85" y1="1773" x2="1320" y2="1773"/>
+  </g>
+
+  <!-- Vertical divider between task and DUE columns -->
+  <line x1="1164" y1="205" x2="1164" y2="1773" stroke="#c8c8c8" stroke-width="2"/>
+</svg>

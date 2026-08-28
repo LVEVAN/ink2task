@@ -6,6 +6,9 @@ import {PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {toAbsolute} from './notePicker';
 import {TEMPLATE_PNG_BASE64} from './templateAsset';
 import {TEMPLATE_MANTA_PNG_BASE64} from './templateAssetManta';
+import {TEMPLATE_V2_PNG_BASE64} from './templateAssetV2';
+import {TEMPLATE_MANTA_V2_PNG_BASE64} from './templateAssetMantaV2';
+import {UNRULED_LAYOUT_VERSION} from './rowDensity';
 
 /**
  * createNote requires a non-empty template path -- omitting it makes the call
@@ -34,6 +37,16 @@ const OLD_TEMPLATE = '/MyStyle/Ink2Task_Template.png';
 // in; see checklistPage.ts's use of it (via getNoteTemplateVersion) to decide
 // whether it's safe to skip drawing checkboxes as elements.
 const NOTE_TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Note.version';
+// PER-NOTE creation versions, keyed by absolute note path. The single file
+// above records only the most recently created note, so creating a SECOND note
+// silently relabels the first one's background -- tolerable when all it
+// decided was whether to skip drawing checkboxes, but the row-density feature
+// reads the same signal to decide whether a note's background still carries
+// the printed 14-row ruling, and a wrong answer there draws dense rows over
+// it. New notes are recorded here; notes that predate this map fall back to
+// the single file (right whenever the user has only ever had one note, which
+// is the overwhelmingly common case).
+const NOTE_VERSIONS_FILE = '/MyStyle/Ink2Task/Ink2Task_NoteVersions.json';
 
 // Bump whenever the embedded template PNG design changes, so devices that
 // already have an older copy get the new one rewritten on the next run.
@@ -52,7 +65,19 @@ const NOTE_TEMPLATE_VERSION_FILE = '/MyStyle/Ink2Task/Ink2Task_Note.version';
 //   v13 - "DUE" header baseline aligned with SYNC's (was 3px high)
 //   v14 - SYNC button and platform:list title swapped: SYNC now centered
 //         in the top row, title moved to SYNC's old left spot
-const TEMPLATE_VERSION = '16';
+//   v17 - "unruled": interior row lines and checkboxes REMOVED from the
+//         background (drawn as elements per the row-density setting instead),
+//         SYNC pill and DUE header ~2/3 size. Must stay >= rowDensity.ts's
+//         UNRULED_LAYOUT_VERSION -- that is the threshold the drawing code
+//         uses to decide whether a note's background still carries the ruling.
+const TEMPLATE_VERSION = String(UNRULED_LAYOUT_VERSION);
+/**
+ * The last RULED template version, still shipped (templateAsset.ts): appending
+ * a page to a note created before v17 must bake the ruled background that
+ * note's other pages have, or the new page draws 14 invisible rows -- see
+ * appendTemplatedPage's `legacyRuled` option.
+ */
+const LEGACY_TEMPLATE_VERSION = '16';
 
 /**
  * The template version at which checkboxes were added to the baked-in
@@ -70,9 +95,12 @@ export const CHECKBOX_BAKE_VERSION = 11;
  * install that only has the .snplg always ends up with the current design (and
  * so redesigns don't require manually deleting the old PNG).
  */
-async function templateBase64ForDevice(): Promise<string> {
+async function templateBase64ForDevice(version: string): Promise<string> {
   const manta = await detectMantaClass();
-  return manta ? TEMPLATE_MANTA_PNG_BASE64 : TEMPLATE_PNG_BASE64;
+  if (version === LEGACY_TEMPLATE_VERSION) {
+    return manta ? TEMPLATE_MANTA_PNG_BASE64 : TEMPLATE_PNG_BASE64;
+  }
+  return manta ? TEMPLATE_MANTA_V2_PNG_BASE64 : TEMPLATE_V2_PNG_BASE64;
 }
 
 /**
@@ -98,7 +126,15 @@ async function detectMantaClass(): Promise<boolean> {
   return manta;
 }
 
-async function ensureTemplate(): Promise<void> {
+/**
+ * Stages the template PNG a createNote/insertNotePage that follows is going to
+ * bake. `version` is which DESIGN to stage -- the current one by default, or
+ * LEGACY_TEMPLATE_VERSION when a page is being appended to a pre-v17 note (the
+ * new page must match its siblings' ruled background). The version marker
+ * records what the file currently holds, so switching between the two is just
+ * a rewrite; harmless beyond one ~30KB file write.
+ */
+async function ensureTemplate(version: string = TEMPLATE_VERSION): Promise<void> {
   // Writes the template PNG into MyStyle, so this one genuinely needs the write
   // permission -- see utils/permissions.ts. Cheap after the first call.
   await requireFileWrite();
@@ -110,13 +146,13 @@ async function ensureTemplate(): Promise<void> {
   } catch {
     // treat unreadable version as "needs rewrite"
   }
-  if (!(await RNFS.exists(path)) || current !== TEMPLATE_VERSION) {
+  if (!(await RNFS.exists(path)) || current !== version) {
     const dir = path.slice(0, path.lastIndexOf('/'));
     if (!(await RNFS.exists(dir))) await RNFS.mkdir(dir);
-    const base64 = await templateBase64ForDevice();
+    const base64 = await templateBase64ForDevice(version);
     await RNFS.writeFile(path, base64, 'base64');
     try {
-      await RNFS.writeFile(versionPath, TEMPLATE_VERSION, 'utf8');
+      await RNFS.writeFile(versionPath, version, 'utf8');
     } catch {
       // non-critical: without the marker it just rewrites again next run
     }
@@ -169,31 +205,70 @@ export async function ensureNote(notePath: string): Promise<boolean> {
   // from -- see NOTE_TEMPLATE_VERSION_FILE's comment above. Best-effort, same
   // reasoning as ensureTemplate's own version-marker write: without it, the
   // next check just falls back to "assume old template" (still correct, just
-  // draws checkboxes as elements unnecessarily on this one note).
+  // draws checkboxes as elements unnecessarily on this one note, and pins it
+  // to the 14-row layout).
   try {
     await RNFS.writeFile(toAbsolute(NOTE_TEMPLATE_VERSION_FILE), TEMPLATE_VERSION, 'utf8');
   } catch {
     // non-critical, see above
   }
+  await recordNoteVersion(absolutePath, TEMPLATE_VERSION);
   return true;
 }
 
+/** Reads the per-note version map; {} on any failure. */
+async function readNoteVersions(): Promise<{[absPath: string]: number}> {
+  try {
+    const raw = await RNFS.readFile(toAbsolute(NOTE_VERSIONS_FILE), 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Best-effort: a lost record just pins that note to the legacy 14-row layout. */
+async function recordNoteVersion(absPath: string, version: string): Promise<void> {
+  try {
+    const map = await readNoteVersions();
+    map[absPath] = parseInt(version, 10);
+    await RNFS.writeFile(toAbsolute(NOTE_VERSIONS_FILE), JSON.stringify(map), 'utf8');
+  } catch {
+    // non-critical, see above
+  }
+}
+
 /**
- * Whether the CURRENT note (the one at config.notePath) was created from a
- * template version that already has checkboxes baked into its background --
- * i.e. whether it's safe to skip drawing them as elements. Reads the marker
- * ensureNote() writes at creation time; missing/unreadable defaults to false
- * (draw them, the always-correct fallback) rather than assuming a newer
- * version than we can actually confirm.
+ * The template version a note's background was created from: the per-note map
+ * first, the single legacy marker file second, 0 when neither knows. 0 means
+ * "assume the old ruled template" everywhere this is consumed -- the guess
+ * that can't draw a mismatched layout over a printed ruling (rowsForRun in
+ * ./rowDensity) and can't skip checkboxes that aren't really baked in.
  */
-export async function noteHasBakedInCheckboxes(): Promise<boolean> {
+export async function noteLayoutVersion(notePath: string): Promise<number> {
+  const map = await readNoteVersions();
+  const recorded = map[toAbsolute(notePath)];
+  if (Number.isFinite(recorded)) return recorded;
   try {
     const raw = (await RNFS.readFile(toAbsolute(NOTE_TEMPLATE_VERSION_FILE), 'utf8')).trim();
     const version = parseInt(raw, 10);
-    return Number.isFinite(version) && version >= CHECKBOX_BAKE_VERSION;
+    return Number.isFinite(version) ? version : 0;
   } catch {
-    return false;
+    return 0;
   }
+}
+
+/**
+ * Whether this note was created from a template version that has checkboxes
+ * baked into its background -- i.e. whether it's safe to skip drawing them as
+ * elements. Only the v11..v16 ruled templates do: v17+ removed them along
+ * with the ruling (the row density decides where they go, so they must be
+ * elements). Missing/unreadable defaults to false (draw them, the
+ * always-correct fallback) rather than assuming a version we can't confirm.
+ */
+export async function noteHasBakedInCheckboxes(notePath: string): Promise<boolean> {
+  const version = await noteLayoutVersion(notePath);
+  return version >= CHECKBOX_BAKE_VERSION && version < UNRULED_LAYOUT_VERSION;
 }
 
 /**
@@ -253,9 +328,14 @@ export async function notePageCount(notePath: string): Promise<number> {
 export async function insertTemplatedPageAt(
   notePath: string,
   page: number,
+  opts?: {legacyRuled?: boolean},
 ): Promise<boolean> {
   const absolutePath = toAbsolute(notePath);
-  await ensureTemplate();
+  // A page joining a pre-v17 note must bake the RULED background its sibling
+  // pages have -- the unruled v17 design would leave its 14 rows invisible
+  // (the note stays pinned to 14 rows, and interior lines are only drawn for
+  // v17+ pages). See rowsForRun's `legacyRuled` in ./rowDensity.
+  await ensureTemplate(opts?.legacyRuled ? LEGACY_TEMPLATE_VERSION : TEMPLATE_VERSION);
   const before = await notePageCount(absolutePath);
   if (before <= 0) return false;
   // Inserting past the end is an append, which has its own function and does
@@ -286,9 +366,13 @@ export async function insertTemplatedPageAt(
   return grew;
 }
 
-export async function appendTemplatedPage(notePath: string): Promise<boolean> {
+export async function appendTemplatedPage(
+  notePath: string,
+  opts?: {legacyRuled?: boolean},
+): Promise<boolean> {
   const absolutePath = toAbsolute(notePath);
-  await ensureTemplate();
+  // Same reasoning as insertTemplatedPageAt: match the note's existing pages.
+  await ensureTemplate(opts?.legacyRuled ? LEGACY_TEMPLATE_VERSION : TEMPLATE_VERSION);
   const before = await notePageCount(absolutePath);
   try {
     // `page` is where the new page goes. Appending means the current count,

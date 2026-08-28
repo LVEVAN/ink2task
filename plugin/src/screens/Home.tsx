@@ -1037,6 +1037,35 @@ export default function Home() {
               </View>
             </View>
 
+            <Text style={styles.subSectionLabel}>Rows per page</Text>
+            <View style={[styles.fontRow, {marginTop: 4}]}>
+              {(
+                [
+                  {key: 'standard', label: 'Standard · 14'},
+                  {key: 'compact', label: 'Compact · 18'},
+                  {key: 'dense', label: 'Dense · 21'},
+                ] as const
+              ).map(d => {
+                const selected = (config.rowDensity ?? 'standard') === d.key;
+                return (
+                  <Pressable
+                    key={d.key}
+                    style={[styles.fontChip, selected && styles.fontChipOn]}
+                    onPress={() => setConfig({...config, rowDensity: d.key})}>
+                    <Text style={[styles.fontChipText, selected && styles.fontChipTextOn]}>
+                      {d.label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Text style={styles.toggleHint}>
+              More rows = smaller text and checkboxes. Applies where Ink2Task draws the
+              ruling itself: list notes created from now on, and "use current note"
+              pages. A note made from the older printed template keeps its 14 rows --
+              delete it (or point Ink2Task at a fresh note) to get the new layout.
+            </Text>
+
             <Text style={styles.subSectionLabel}>Time format</Text>
             <View style={[styles.fontRow, {marginTop: 4}]}>
               <Pressable
